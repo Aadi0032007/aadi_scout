@@ -1,0 +1,364 @@
+"""
+Sensor readers — IMU (WIT/JY901 over UART) and GPS (NMEA over UART).
+
+Both read serial ports directly. No journalctl, no ROS2 subscriptions,
+no external service dependencies. Each runs in a background daemon thread
+and exposes a latest-snapshot via get().
+
+IMU frames are 11 bytes: 0x55, frame_id, 8 payload, checksum.
+GPS sentences are standard NMEA + Unicore UM982 #ADRNAVA extensions.
+"""
+from __future__ import annotations
+
+import math
+import threading
+import time
+from typing import Optional
+
+from .common import log
+
+try:
+    import serial   # type: ignore
+    _HAS_SERIAL = True
+except ImportError:
+    _HAS_SERIAL = False
+
+
+# ═══ IMU ══════════════════════════════════════════════════════════════════════
+
+# WIT protocol constants
+_IMU_FRAME_LEN = 11
+_IMU_SYNC      = 0x55
+_IMU_KNOWN_IDS = {0x51, 0x52, 0x53, 0x54, 0x59}   # accel, gyro, RPY, mag, quat
+
+
+def _imu_checksum_ok(frame: bytes) -> bool:
+    return (sum(frame[:10]) & 0xFF) == frame[10]
+
+
+def _imu_int16(lo: int, hi: int) -> int:
+    v = (hi << 8) | lo
+    return v - 0x10000 if v >= 0x8000 else v
+
+
+class ImuReader:
+    """Reads WIT/JY901-style binary frames directly from a UART."""
+
+    def __init__(self, port: str, baud: int = 9600) -> None:
+        self._port = port
+        self._baud = baud
+        self._data: dict = {}
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True, name="imu-reader")
+
+    def start(self) -> None:
+        if not _HAS_SERIAL:
+            log("sensors", "pyserial not installed — IMU disabled")
+            return
+        self._thread.start()
+        log("sensors", f"IMU reader started ({self._port} @ {self._baud})")
+
+    def get(self) -> dict:
+        with self._lock:
+            return dict(self._data)
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    # ── internals ─────────────────────────────────────────────────────────────
+
+    def _run(self) -> None:
+        backoff = 1.0
+        buf = bytearray()
+
+        while not self._stop.is_set():
+            ser = self._open()
+            if ser is None:
+                self._stop.wait(timeout=backoff)
+                backoff = min(backoff * 2, 10.0)
+                continue
+            backoff = 1.0
+            buf.clear()
+
+            try:
+                while not self._stop.is_set():
+                    chunk = ser.read(ser.in_waiting or 1)
+                    if not chunk:
+                        continue
+                    buf.extend(chunk)
+                    self._drain_frames(buf)
+            except Exception as exc:
+                log("sensors", f"IMU read error: {exc}")
+            finally:
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+
+    def _open(self):
+        try:
+            return serial.Serial(
+                port=self._port,
+                baudrate=self._baud,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+                timeout=0.05,
+            )
+        except Exception as exc:
+            log("sensors", f"IMU open failed {self._port}: {exc}")
+            return None
+
+    def _drain_frames(self, buf: bytearray) -> None:
+        """Parse all complete frames from buf, leaving any partial tail."""
+        while len(buf) >= _IMU_FRAME_LEN:
+            # Find sync byte
+            if buf[0] != _IMU_SYNC:
+                buf.pop(0)
+                continue
+            frame = bytes(buf[:_IMU_FRAME_LEN])
+            if not _imu_checksum_ok(frame):
+                buf.pop(0)
+                continue
+            self._decode(frame)
+            del buf[:_IMU_FRAME_LEN]
+
+    def _decode(self, frame: bytes) -> None:
+        fid = frame[1]
+        if fid not in _IMU_KNOWN_IDS:
+            return
+        d = frame[2:10]
+        upd: dict = {}
+
+        if fid == 0x51:   # accelerometer in g (range ±16g)
+            upd["accelerometer_x"] = _imu_int16(d[0], d[1]) / 32768.0 * 16.0
+            upd["accelerometer_y"] = _imu_int16(d[2], d[3]) / 32768.0 * 16.0
+            upd["accelerometer_z"] = _imu_int16(d[4], d[5]) / 32768.0 * 16.0
+        elif fid == 0x52: # gyroscope in deg/s (range ±2000 dps)
+            upd["gyroscope_x"] = _imu_int16(d[0], d[1]) / 32768.0 * 2000.0
+            upd["gyroscope_y"] = _imu_int16(d[2], d[3]) / 32768.0 * 2000.0
+            upd["gyroscope_z"] = _imu_int16(d[4], d[5]) / 32768.0 * 2000.0
+        elif fid == 0x53: # roll/pitch/yaw in degrees (range ±180°)
+            upd["roll"]  = _imu_int16(d[0], d[1]) / 32768.0 * 180.0
+            upd["pitch"] = _imu_int16(d[2], d[3]) / 32768.0 * 180.0
+            upd["yaw"]   = _imu_int16(d[4], d[5]) / 32768.0 * 180.0
+        elif fid == 0x54: # magnetometer raw counts
+            upd["magnetometer_x"] = float(_imu_int16(d[0], d[1]))
+            upd["magnetometer_y"] = float(_imu_int16(d[2], d[3]))
+            upd["magnetometer_z"] = float(_imu_int16(d[4], d[5]))
+        elif fid == 0x59: # quaternion (normalized -1..+1)
+            upd["quat_w"] = _imu_int16(d[0], d[1]) / 32768.0
+            upd["quat_x"] = _imu_int16(d[2], d[3]) / 32768.0
+            upd["quat_y"] = _imu_int16(d[4], d[5]) / 32768.0
+            upd["quat_z"] = _imu_int16(d[6], d[7]) / 32768.0
+
+        if upd:
+            with self._lock:
+                self._data.update(upd)
+
+
+# ═══ GPS ══════════════════════════════════════════════════════════════════════
+
+class GpsReader:
+    """Reads NMEA + UM982 #ADRNAVA sentences directly from a UART."""
+
+    _FIX_LABEL = {
+        0: "NO_FIX", 1: "GPS_FIX", 2: "DGPS_FIX",
+        4: "RTK_FIXED", 5: "RTK_FLOAT", 6: "ESTIMATED",
+    }
+
+    def __init__(self, port: str, baud: int = 115200) -> None:
+        self._port = port
+        self._baud = baud
+        self._data: dict = {}
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True, name="gps-reader")
+
+    def start(self) -> None:
+        if not _HAS_SERIAL:
+            log("sensors", "pyserial not installed — GPS disabled")
+            return
+        self._thread.start()
+        log("sensors", f"GPS reader started ({self._port} @ {self._baud})")
+
+    def get(self) -> dict:
+        with self._lock:
+            return dict(self._data)
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    # ── internals ─────────────────────────────────────────────────────────────
+
+    def _run(self) -> None:
+        backoff = 1.0
+        while not self._stop.is_set():
+            ser = self._open()
+            if ser is None:
+                self._stop.wait(timeout=backoff)
+                backoff = min(backoff * 2, 10.0)
+                continue
+            backoff = 1.0
+
+            try:
+                while not self._stop.is_set():
+                    raw = ser.readline()
+                    if not raw:
+                        continue
+                    line = raw.decode("ascii", errors="ignore").strip()
+                    if not line:
+                        continue
+                    self._parse(line)
+            except Exception as exc:
+                log("sensors", f"GPS read error: {exc}")
+            finally:
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+
+    def _open(self):
+        try:
+            return serial.Serial(
+                port=self._port,
+                baudrate=self._baud,
+                timeout=1.0,
+            )
+        except Exception as exc:
+            log("sensors", f"GPS open failed {self._port}: {exc}")
+            return None
+
+    # ── parser ────────────────────────────────────────────────────────────────
+
+    def _parse(self, line: str) -> None:
+        if line.startswith("$"):
+            core = line[1:].split("*", 1)[0]
+            parts = core.split(",")
+            if not parts:
+                return
+            msg = parts[0]
+            if   msg.endswith("GGA"): self._parse_gga(parts)
+            elif msg.endswith("RMC"): self._parse_rmc(parts)
+            elif msg.endswith("VTG"): self._parse_vtg(parts)
+            elif msg.endswith("HDT"): self._parse_hdt(parts)
+        elif line.startswith("#ADRNAVA"):
+            self._parse_adrnava(line)
+
+    # ── NMEA helpers ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _dm_to_decimal(value: str, hemi: str) -> Optional[float]:
+        if not value:
+            return None
+        try:
+            raw = float(value)
+        except ValueError:
+            return None
+        deg = int(raw / 100)
+        minutes = raw - (deg * 100)
+        dec = deg + (minutes / 60.0)
+        return -dec if hemi in ("S", "W") else dec
+
+    @staticmethod
+    def _to_float(v: str) -> Optional[float]:
+        try:
+            return float(v)
+        except (ValueError, TypeError):
+            return None
+
+    @staticmethod
+    def _to_int(v: str) -> Optional[int]:
+        try:
+            return int(v)
+        except (ValueError, TypeError):
+            return None
+
+    # ── per-sentence parsers ──────────────────────────────────────────────────
+
+    def _parse_gga(self, parts: list) -> None:
+        if len(parts) < 12:
+            return
+        upd: dict = {}
+        lat = self._dm_to_decimal(parts[2], parts[3])
+        lon = self._dm_to_decimal(parts[4], parts[5])
+        fix = self._to_int(parts[6])
+        if lat is not None: upd["gps_latitude"]  = lat
+        if lon is not None: upd["gps_longitude"] = lon
+        if fix is not None:
+            upd["gps_status"] = fix
+            upd["gps_fix"]    = self._FIX_LABEL.get(fix, "UNKNOWN")
+        sats = self._to_int(parts[7]);   alt  = self._to_float(parts[9])
+        hdop = self._to_float(parts[8])
+        if sats is not None: upd["gps_satellites"] = sats
+        if hdop is not None: upd["gps_hdop"]       = hdop
+        if alt  is not None: upd["gps_altitude"]   = alt
+        self._merge(upd)
+
+    def _parse_rmc(self, parts: list) -> None:
+        if len(parts) < 10:
+            return
+        upd: dict = {}
+        lat = self._dm_to_decimal(parts[3], parts[4])
+        lon = self._dm_to_decimal(parts[5], parts[6])
+        sog = self._to_float(parts[7])    # speed in knots
+        cog = self._to_float(parts[8])    # course over ground (deg)
+        if lat is not None: upd["gps_latitude"]  = lat
+        if lon is not None: upd["gps_longitude"] = lon
+        if sog is not None:
+            upd["gps_speed_knots"] = sog
+            upd["gps_speed_kmh"]   = round(sog * 1.852, 3)
+        if cog is not None:
+            upd["gps_cog"] = cog
+            # COG is yaw fallback if true heading isn't being published
+            self._set_default("orientation", cog)
+        self._merge(upd)
+
+    def _parse_vtg(self, parts: list) -> None:
+        if len(parts) < 9:
+            return
+        upd: dict = {}
+        cog     = self._to_float(parts[1])
+        spd_kmh = self._to_float(parts[7])
+        if cog is not None:
+            upd["gps_cog"] = cog
+            self._set_default("orientation", cog)
+        if spd_kmh is not None:
+            upd["gps_speed_kmh"] = spd_kmh
+        self._merge(upd)
+
+    def _parse_hdt(self, parts: list) -> None:
+        if len(parts) < 2:
+            return
+        hdg = self._to_float(parts[1])
+        if hdg is not None:
+            # HDT is true heading from dual-antenna RTK — overrides COG fallback
+            with self._lock:
+                self._data["orientation"]      = hdg
+                self._data["heading_deg_true"] = hdg
+
+    def _parse_adrnava(self, line: str) -> None:
+        """Unicore UM982 extended sentence with solution status + position type."""
+        body = line[1:].split("*", 1)[0]
+        if ";" in body:
+            header, payload = body.split(";", 1)
+        else:
+            header, payload = body, ""
+        p = payload.split(",") if payload else []
+        upd: dict = {}
+        if len(p) > 0 and p[0]: upd["gps_solution_status"] = p[0]
+        if len(p) > 1 and p[1]: upd["gps_position_type"]   = p[1]
+        if upd:
+            self._merge(upd)
+
+    # ── state helpers ─────────────────────────────────────────────────────────
+
+    def _merge(self, upd: dict) -> None:
+        with self._lock:
+            self._data.update(upd)
+
+    def _set_default(self, key: str, value: float) -> None:
+        """Set a field only if it doesn't already exist. HDT > COG precedence."""
+        with self._lock:
+            self._data.setdefault(key, value)
