@@ -141,12 +141,12 @@ class LabConfig:
     })
 
     # ── Daily streaming ───────────────────────────────────────────────────────
-    daily_room_url:         str   = "https://revobots.daily.co/scout-lab"
-    daily_room_name:        str   = "scout-lab"
+    daily_room_url:         str   = "https://revolabs.daily.co/scoutlab-pilot-cam"
+    daily_room_name:        str   = "scoutlab-pilot-cam"
     stream_width:           int   = 640
     stream_height:          int   = 480
     stream_fps:             int   = 15
-    initial_main_source:    str   = "ai_front"   # which camera is shown on startup
+    initial_main_source:    str   = "floor"   # which camera is shown on startup
 
     # ── PiP thumbnails on the main stream ─────────────────────────────────────
     pip_enabled:            bool  = True
