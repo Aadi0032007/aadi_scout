@@ -26,7 +26,6 @@ Layout:
         → on exit: stop everything in reverse order
 """
 from __future__ import annotations
-from _typeshed import _type_checker_internals
 
 import argparse
 import json
