@@ -182,13 +182,13 @@ def main():
                 if data and ser is not None:
                     try:
                         ser.write(data)
-                    except serial.SerialTimeoutException:
-                        # Non-fatal: The receiver's buffer is full. 
-                        # Drop this RTCM chunk but KEEP the connection alive!
-                        pass 
+                    except (serial.SerialTimeoutException, serial.SerialException, OSError):
+                        # Heavy data pressure or full hardware buffers.
+                        # Simply drop this packet and keep the serial line alive!
+                        pass
                     except Exception as exc:
-                        # Fatal: Device unplugged or actual hardware failure.
-                        print(f"[gps_mux] fatal write err: {exc}", flush=True)
+                        # Actual device unplugged or unrecoverable system failure.
+                        print(f"[gps_mux] Fatal hardware failure: {exc}", flush=True)
                         try: ser.close()
                         except Exception: pass
                         ser = None
