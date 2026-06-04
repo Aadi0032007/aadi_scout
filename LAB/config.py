@@ -104,6 +104,7 @@ class LabConfig:
         "ugreen", "u_green", "usb_audio", "usb-audio", "emeet", "alsa_input.usb-",
     ])
 
+    """
     # ── Cameras ───────────────────────────────────────────────────────────────
     cameras: list = field(default_factory=lambda: [
         CameraConfig(
@@ -126,6 +127,34 @@ class LabConfig:
             source="/dev/floor_cam",        # udev symlink — set this up in /etc/udev/rules.d
             width=640, height=480, fps=15,
         ),
+    ])"""
+
+    # ── Cameras ───────────────────────────────────────────────────────────────
+    cameras: list = field(default_factory=lambda: [
+        # Orbital is on the network
+        CameraConfig(
+            name="orbital",
+    	    source="rtsp://revolabs:revolabs123%40@192.168.10.50:554/h264Preview_01_sub",
+	    width=640, height=480, fps=15, rtsp_transport="tcp",
+        ),
+        # Front AI camera is on USB
+        CameraConfig(
+            name="ai_front",
+            source="/dev/v4l/by-id/usb-HD_Camera_Manufacturer_HD_USB_Camera_2020101401-video-index0", 
+            width=640, height=480, fps=15,
+        ),
+        # Rear AI camera is on USB (fallback to /dev/videoX if you don't have the exact by-id path)
+        CameraConfig(
+            name="ai_back",
+            source="/dev/video2", # You might need to change this to video0 or video1 depending on how Ubuntu enumerates them
+            width=640, height=480, fps=15,
+        ),
+        # Floor camera is on USB
+        CameraConfig(
+            name="floor",
+            source="/dev/floor_cam",        
+            width=640, height=480, fps=15,
+        ),
     ])
 
     # The gamepad sends these camera names. Map them to our internal names above.
@@ -143,21 +172,21 @@ class LabConfig:
     # ── Daily streaming ───────────────────────────────────────────────────────
     daily_room_url:         str   = "https://revolabs.daily.co/scoutlab-pilot-cam"
     daily_room_name:        str   = "scoutlab-pilot-cam"
-    stream_width:           int   = 640
-    stream_height:          int   = 480
+    stream_width:           int   = 1280
+    stream_height:          int   = 720
     stream_fps:             int   = 15
     initial_main_source:    str   = "floor"   # which camera is shown on startup
 
     # ── PiP thumbnails on the main stream ─────────────────────────────────────
     pip_enabled:            bool  = True
     pip_left_source:        str   = "orbital"     # pilot on left
-    pip_right_source:       str   = "ai_back"     # rear on right
+    pip_right_source:       str   = "ai_front"     # rear on right
     pip_width:              int   = 192
     pip_height:             int   = 144
     pip_margin:             int   = 12
     pip_gap:                int   = 8
     pip_stale_sec:          float = 0.60          # drop thumbnails older than this
-    pip_show_label:         bool  = True
+    pip_show_label:         bool  = False
 
     # Speed/camera-name badges
     overlay_speed_badge:    bool  = True

@@ -31,6 +31,12 @@ import requests
 
 from .common import log
 
+# Global import for EventHandler so the _CallHandler class can inherit from it
+try:
+    from daily import EventHandler
+except ImportError:
+    EventHandler = object
+
 
 class DailyStream:
     def __init__(
@@ -121,7 +127,7 @@ class DailyStream:
             return
 
         try:
-            from daily import Daily, CallClient, EventHandler   # type: ignore
+            from daily import Daily, CallClient   # type: ignore
 
             token = self._get_token()
             Daily.init()
@@ -154,7 +160,7 @@ class DailyStream:
                     },
                     "publishing": {
                         "camera":     {"isPublishing": True},
-                        "microphone": {"isPublishing": self._mic_device is not None},
+                        "microphone": {"isPublishing": self._mic_device is None},
                     },
                 },
             )
@@ -193,6 +199,7 @@ class DailyStream:
             try:
                 self._client.leave()
                 self._client.release()
+                self._client.destroy()
             except Exception:
                 pass
 
@@ -447,9 +454,10 @@ class DailyStream:
             self._mic_proc = None
 
 
-class _CallHandler:
+class _CallHandler(EventHandler):
     """Minimal event handler — just signals when we've joined."""
     def __init__(self):
+        super().__init__()
         self.joined = threading.Event()
         self.left   = threading.Event()
 
