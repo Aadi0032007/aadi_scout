@@ -191,7 +191,7 @@ class LabConfig:
 
     # ── Recording ─────────────────────────────────────────────────────────────
     cache_dir:              str   = os.path.expanduser("~/.cache/scout/lab")
-    record_camera_name:     str   = "floor"       # which camera goes into the MP4
+    record_camera_name:     str   = "ai_front"       # which camera goes into the MP4
     record_width:           int   = 640
     record_height:          int   = 480
     record_fps:             int   = 15            # same as stream — frame-aligned
