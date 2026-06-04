@@ -4,7 +4,7 @@ Standalone controller and dataset recorder for the Segway Scout XT.
 One command starts everything — teleop, Daily streaming, sensors, lights, PTZ, audio, and optional recording.
 
 ```bash
-source /opt/ros/humble/setup.bash
+./ros_start.sh&
 python LAB/teleop.py
 ```
 
