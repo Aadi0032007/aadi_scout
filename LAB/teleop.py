@@ -25,8 +25,8 @@ Layout:
         → main tick: source arbitration, keyboard, shutdown
         → on exit: stop everything in reverse order
 """
-from _typeshed import _type_checker_internals
 from __future__ import annotations
+from _typeshed import _type_checker_internals
 
 import argparse
 import json
