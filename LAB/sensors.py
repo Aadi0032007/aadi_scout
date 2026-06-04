@@ -350,4 +350,6 @@ class GpsReader:
 
     def _set_default(self, key: str, value: float) -> None:
         with self._lock:
-            self._data.setdefault(key, value)
+            # Only use COG for orientation if we DON'T have a True Heading yet.
+            if "heading_deg_true" not in self._data:
+                self._data[key] = value
