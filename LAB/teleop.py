@@ -560,10 +560,20 @@ def main() -> None:
     log("teleop", "ready — 'r' to toggle recording, Ctrl-C to quit")
 
     try:
-        while running.is_set():
-            time.sleep(0.5)
-    except KeyboardInterrupt:
-        pass
+        try:
+            while running.is_set():
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            pass
+    finally:
+        # ── Shutdown ─────────────────────────────────────────────────────────────
+        log("teleop", "shutting down…")
+
+        try:
+            if recorder.is_active():
+                recorder.stop()
+        except Exception as exc:
+            log("teleop", f"recorder stop error: {exc}")
 
     # ── Shutdown ─────────────────────────────────────────────────────────────
 
