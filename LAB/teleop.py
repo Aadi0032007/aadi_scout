@@ -33,7 +33,6 @@ Layout:
         → main tick: source arbitration, keyboard, shutdown
         → on exit: stop everything in reverse order
 """
-from __future__ import annotations
 
 import argparse
 import json
