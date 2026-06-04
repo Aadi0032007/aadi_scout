@@ -163,7 +163,7 @@ class LabConfig:
     # ── PiP thumbnails on the main stream ─────────────────────────────────────
     pip_enabled:            bool  = True
     pip_left_source:        str   = "orbital"     # pilot on left
-    pip_right_source:       str   = "ai_front"     # rear on right
+    pip_right_source:       str   = "ai_back"     # rear on right
     pip_width:              int   = 192
     pip_height:             int   = 144
     pip_margin:             int   = 12
