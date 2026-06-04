@@ -22,6 +22,8 @@ import math
 import threading
 import time
 from typing import Optional
+import socket as _socket
+
 
 from .common import log
 
@@ -168,28 +170,27 @@ class ImuReader:
 
 # ═══ GPS ══════════════════════════════════════════════════════════════════════
 
+
 class GpsReader:
-    """Reads NMEA + UM982 #ADRNAVA sentences directly from a UART."""
+    """Reads NMEA + UM982 #ADRNAVA sentences from a UDP socket fed by gps_mux."""
 
     _FIX_LABEL = {
         0: "NO_FIX", 1: "GPS_FIX", 2: "DGPS_FIX",
         4: "RTK_FIXED", 5: "RTK_FLOAT", 6: "ESTIMATED",
     }
 
-    def __init__(self, port: str, baud: int = 115200) -> None:
-        self._port = port
-        self._baud = baud
+    def __init__(self, udp_host: str = "127.0.0.1", udp_port: int = 57002) -> None:
+        self._host = udp_host
+        self._port = udp_port
         self._data: dict = {}
         self._lock = threading.Lock()
         self._stop = threading.Event()
+        self._sock: Optional[_socket.socket] = None
         self._thread = threading.Thread(target=self._run, daemon=True, name="gps-reader")
 
     def start(self) -> None:
-        if not _HAS_SERIAL:
-            log("sensors", "pyserial not installed — GPS disabled")
-            return
         self._thread.start()
-        log("sensors", f"GPS reader started ({self._port} @ {self._baud})")
+        log("sensors", f"GPS reader started (udp://{self._host}:{self._port})")
 
     def get(self) -> dict:
         with self._lock:
@@ -197,14 +198,23 @@ class GpsReader:
 
     def stop(self) -> None:
         self._stop.set()
+        if self._sock is not None:
+            try: self._sock.close()
+            except Exception: pass
 
     # ── internals ─────────────────────────────────────────────────────────────
 
     def _run(self) -> None:
         backoff = 1.0
         while not self._stop.is_set():
-            ser = self._open()
-            if ser is None:
+            try:
+                s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+                s.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+                s.bind((self._host, self._port))
+                s.settimeout(0.5)
+                self._sock = s
+            except OSError as exc:
+                log("sensors", f"GPS UDP bind {self._host}:{self._port} failed: {exc}")
                 self._stop.wait(timeout=backoff)
                 backoff = min(backoff * 2, 10.0)
                 continue
@@ -212,33 +222,23 @@ class GpsReader:
 
             try:
                 while not self._stop.is_set():
-                    raw = ser.readline()
-                    if not raw:
+                    try:
+                        data, _ = s.recvfrom(2048)
+                    except _socket.timeout:
                         continue
-                    line = raw.decode("ascii", errors="ignore").strip()
-                    if not line:
+                    if not data:
                         continue
-                    self._parse(line)
+                    line = data.decode("ascii", errors="ignore").strip()
+                    if line:
+                        self._parse(line)
             except Exception as exc:
-                log("sensors", f"GPS read error: {exc}")
+                log("sensors", f"GPS recv error: {exc}")
             finally:
-                try:
-                    ser.close()
-                except Exception:
-                    pass
+                try: s.close()
+                except Exception: pass
+                self._sock = None
 
-    def _open(self):
-        try:
-            return serial.Serial(
-                port=self._port,
-                baudrate=self._baud,
-                timeout=1.0,
-            )
-        except Exception as exc:
-            log("sensors", f"GPS open failed {self._port}: {exc}")
-            return None
-
-    # ── parser ────────────────────────────────────────────────────────────────
+    # ── parser (UNCHANGED from previous version) ──────────────────────────────
 
     def _parse(self, line: str) -> None:
         if line.startswith("$"):
@@ -253,8 +253,6 @@ class GpsReader:
             elif msg.endswith("HDT"): self._parse_hdt(parts)
         elif line.startswith("#ADRNAVA"):
             self._parse_adrnava(line)
-
-    # ── NMEA helpers ──────────────────────────────────────────────────────────
 
     @staticmethod
     def _dm_to_decimal(value: str, hemi: str) -> Optional[float]:
@@ -271,23 +269,16 @@ class GpsReader:
 
     @staticmethod
     def _to_float(v: str) -> Optional[float]:
-        try:
-            return float(v)
-        except (ValueError, TypeError):
-            return None
+        try: return float(v)
+        except (ValueError, TypeError): return None
 
     @staticmethod
     def _to_int(v: str) -> Optional[int]:
-        try:
-            return int(v)
-        except (ValueError, TypeError):
-            return None
-
-    # ── per-sentence parsers ──────────────────────────────────────────────────
+        try: return int(v)
+        except (ValueError, TypeError): return None
 
     def _parse_gga(self, parts: list) -> None:
-        if len(parts) < 12:
-            return
+        if len(parts) < 12: return
         upd: dict = {}
         lat = self._dm_to_decimal(parts[2], parts[3])
         lon = self._dm_to_decimal(parts[4], parts[5])
@@ -297,7 +288,7 @@ class GpsReader:
         if fix is not None:
             upd["gps_status"] = fix
             upd["gps_fix"]    = self._FIX_LABEL.get(fix, "UNKNOWN")
-        sats = self._to_int(parts[7]);   alt  = self._to_float(parts[9])
+        sats = self._to_int(parts[7]);  alt = self._to_float(parts[9])
         hdop = self._to_float(parts[8])
         if sats is not None: upd["gps_satellites"] = sats
         if hdop is not None: upd["gps_hdop"]       = hdop
@@ -305,13 +296,11 @@ class GpsReader:
         self._merge(upd)
 
     def _parse_rmc(self, parts: list) -> None:
-        if len(parts) < 10:
-            return
+        if len(parts) < 10: return
         upd: dict = {}
         lat = self._dm_to_decimal(parts[3], parts[4])
         lon = self._dm_to_decimal(parts[5], parts[6])
-        sog = self._to_float(parts[7])    # speed in knots
-        cog = self._to_float(parts[8])    # course over ground (deg)
+        sog = self._to_float(parts[7]); cog = self._to_float(parts[8])
         if lat is not None: upd["gps_latitude"]  = lat
         if lon is not None: upd["gps_longitude"] = lon
         if sog is not None:
@@ -319,13 +308,11 @@ class GpsReader:
             upd["gps_speed_kmh"]   = round(sog * 1.852, 3)
         if cog is not None:
             upd["gps_cog"] = cog
-            # COG is yaw fallback if true heading isn't being published
             self._set_default("orientation", cog)
         self._merge(upd)
 
     def _parse_vtg(self, parts: list) -> None:
-        if len(parts) < 9:
-            return
+        if len(parts) < 9: return
         upd: dict = {}
         cog     = self._to_float(parts[1])
         spd_kmh = self._to_float(parts[7])
@@ -337,22 +324,19 @@ class GpsReader:
         self._merge(upd)
 
     def _parse_hdt(self, parts: list) -> None:
-        if len(parts) < 2:
-            return
+        if len(parts) < 2: return
         hdg = self._to_float(parts[1])
         if hdg is not None:
-            # HDT is true heading from dual-antenna RTK — overrides COG fallback
             with self._lock:
                 self._data["orientation"]      = hdg
                 self._data["heading_deg_true"] = hdg
 
     def _parse_adrnava(self, line: str) -> None:
-        """Unicore UM982 extended sentence with solution status + position type."""
         body = line[1:].split("*", 1)[0]
         if ";" in body:
-            header, payload = body.split(";", 1)
+            _, payload = body.split(";", 1)
         else:
-            header, payload = body, ""
+            payload = ""
         p = payload.split(",") if payload else []
         upd: dict = {}
         if len(p) > 0 and p[0]: upd["gps_solution_status"] = p[0]
@@ -360,13 +344,10 @@ class GpsReader:
         if upd:
             self._merge(upd)
 
-    # ── state helpers ─────────────────────────────────────────────────────────
-
     def _merge(self, upd: dict) -> None:
         with self._lock:
             self._data.update(upd)
 
     def _set_default(self, key: str, value: float) -> None:
-        """Set a field only if it doesn't already exist. HDT > COG precedence."""
         with self._lock:
             self._data.setdefault(key, value)

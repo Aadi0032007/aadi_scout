@@ -186,8 +186,8 @@ class LabConfig:
     # ── Sensors (direct UART, no journalctl, no ROS2) ─────────────────────────
     imu_port_hint:          str   = "/dev/ttyCH341USB3"
     imu_baud:               int   = 9600
-    gps_port_hint:          str   = "/dev/ttyCH341USB2"
-    gps_baud:               int   = 115200
+    gps_udp_host:           str   = "127.0.0.1"
+    gps_udp_port:           int   = 57002
 
     # ── Recording ─────────────────────────────────────────────────────────────
     cache_dir:              str   = os.path.expanduser("~/.cache/scout/lab")

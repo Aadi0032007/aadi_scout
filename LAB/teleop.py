@@ -313,7 +313,7 @@ def main() -> None:
     imu = ImuReader(port=cfg.imu_port_hint, baud=cfg.imu_baud)
     imu.start()
 
-    gps = GpsReader(port=cfg.gps_port_hint, baud=cfg.gps_baud)
+    gps = GpsReader(udp_host=cfg.gps_udp_host, udp_port=cfg.gps_udp_port)
     gps.start()
 
     motion = MotionController(
