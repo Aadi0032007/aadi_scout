@@ -1,3 +1,10 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Jun  3 20:04:03 2026
+
+@author: Aadi
+"""
+
 """
 REVO Scout LAB — unified controller and recorder.
 
@@ -386,8 +393,8 @@ def main() -> None:
         base_dir           = cfg.cache_dir,
         camera_name        = cfg.record_camera_name,
         cameras            = cameras,
-        width              = cfg.stream_width,
-        height             = cfg.stream_height,
+        width              = cfg.record_width,
+        height             = cfg.record_height,
         fps                = cfg.record_fps,
         video_bitrate      = cfg.record_video_bitrate,
         encoder_preference = cfg.record_encoder_preference,

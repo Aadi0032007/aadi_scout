@@ -1,3 +1,10 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Jun  3 20:04:03 2026
+
+@author: Aadi
+"""
+
 """
 LAB configuration — single source of truth for every tunable value.
 
@@ -147,8 +154,8 @@ class LabConfig:
     # ── Daily streaming ───────────────────────────────────────────────────────
     daily_room_url:         str   = "https://revolabs.daily.co/scoutlab-pilot-cam"
     daily_room_name:        str   = "scoutlab-pilot-cam"
-    stream_width:           int   = 1280
-    stream_height:          int   = 720
+    stream_width:           int   = 640
+    stream_height:          int   = 480
     stream_fps:             int   = 15
     initial_main_source:    str   = "floor"   # which camera is shown on startup
 
@@ -184,6 +191,8 @@ class LabConfig:
     # ── Recording ─────────────────────────────────────────────────────────────
     cache_dir:              str   = os.path.expanduser("~/.cache/scout/lab")
     record_camera_name:     str   = "floor"       # which camera goes into the MP4
+    record_width:           int   = 640
+    record_height:          int   = 480
     record_fps:             int   = 15            # same as stream — frame-aligned
     record_video_bitrate:   str   = "1500k"       # ffmpeg -b:v
     # Encoder preference order — first available wins. Auto-probed at startup.

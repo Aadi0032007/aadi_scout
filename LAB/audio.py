@@ -1,3 +1,10 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Jun  3 20:04:03 2026
+
+@author: Aadi
+"""
+
 """
 Audio: PulseAudio volume, USB sink auto-selection, music playback, Piper TTS.
 
