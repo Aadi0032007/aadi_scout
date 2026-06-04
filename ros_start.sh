@@ -8,23 +8,29 @@ set -e
 LAB_DIR="${LAB_DIR:-$HOME/Revobots/aditya/aadi_scout/LAB}"
 BRINGUP_PID=""
 
+# ── 0. Pre-Flight Cleanup ────────────────────────────────────────────────────
+# Ensure no zombie nodes are holding the Lidar or Motor serial ports open
+echo "[teleop_start] Checking for and killing lingering ROS 2 processes..."
+pkill -f "ros2 launch agv_pro_bringup" || true
+pkill -f "agv_pro_node" || true
+pkill -f "lslidar_driver_node" || true
+sleep 1 # Give the kernel a second to release the /dev/ hardware locks
+
 cleanup() {
     # Disable the trap so we don't recurse if cleanup itself errors
     trap - SIGINT SIGTERM EXIT
 
+    echo
+    echo "[teleop_start] Shutting down ROS 2 bringup..."
+    
     if [ -n "$BRINGUP_PID" ] && kill -0 "$BRINGUP_PID" 2>/dev/null; then
-        echo
-        echo "[teleop_start] Stopping agv_pro_bringup (PID: $BRINGUP_PID)..."
         kill -TERM "$BRINGUP_PID" 2>/dev/null || true
-
-        # Give it 5s to exit gracefully, then force-kill
-        for _ in 1 2 3 4 5; do
-            kill -0 "$BRINGUP_PID" 2>/dev/null || break
-            sleep 1
-        done
-        kill -KILL "$BRINGUP_PID" 2>/dev/null || true
-        wait "$BRINGUP_PID" 2>/dev/null || true
     fi
+
+    # Aggressively kill the child nodes so they release the lidar/serial ports
+    pkill -f "ros2 launch agv_pro_bringup" || true
+    pkill -f "agv_pro_node" || true
+    pkill -f "lslidar_driver_node" || true
 
     echo "[teleop_start] Cleanup complete."
 }
@@ -54,4 +60,7 @@ fi
 # ── 3. Run teleop in the foreground ──────────────────────────────────────────
 echo "[teleop_start] Starting LAB/teleop.py..."
 cd "$LAB_DIR"
-exec python3 teleop.py
+
+# IMPORTANT: Removed 'exec' here so the bash script waits for python to finish.
+# This ensures the EXIT trap is actually triggered when you press Ctrl-C.
+python3 teleop.py
