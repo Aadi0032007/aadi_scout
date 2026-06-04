@@ -4,6 +4,8 @@ Created on Wed Jun  3 20:04:03 2026
 
 @author: Aadi
 """
+from __future__ import annotations
+
 
 """
 Multi-camera capture for stream + recorder.
@@ -20,7 +22,6 @@ the collection. The orchestrator carries on with whichever cameras opened.
 
 Auto-reconnect with exponential backoff on stream drop.
 """
-from __future__ import annotations
 
 import os
 import threading

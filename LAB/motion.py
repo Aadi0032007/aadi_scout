@@ -4,6 +4,8 @@ Created on Wed Jun  3 20:04:03 2026
 
 @author: Aadi
 """
+from __future__ import annotations
+
 
 """
 Motion: UDP commands → /cmd_vel via ROS2.
@@ -24,7 +26,6 @@ Behavior:
 The orchestrator passes parsed values into command() — this controller
 does no UDP work and doesn't know about source arbitration.
 """
-from __future__ import annotations
 
 import threading
 import time

@@ -4,6 +4,8 @@ Created on Wed Jun  3 20:04:03 2026
 
 @author: Aadi
 """
+from __future__ import annotations
+
 
 """
 Audio: PulseAudio volume, USB sink auto-selection, music playback, Piper TTS.
@@ -21,7 +23,6 @@ API:
     play_music(track_num)   — play a WAV from the configured tracks dict
     stop_music()            — halt any currently playing music
 """
-from __future__ import annotations
 
 import os
 import subprocess

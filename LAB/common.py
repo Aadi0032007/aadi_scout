@@ -4,6 +4,8 @@ Created on Wed Jun  3 20:04:03 2026
 
 @author: Aadi
 """
+from __future__ import annotations
+
 
 """
 Shared helpers used across LAB modules.
@@ -11,7 +13,6 @@ Shared helpers used across LAB modules.
 Keep this file tiny — only utilities that genuinely belong in more than one
 place. If something is used by exactly one file, leave it there.
 """
-from __future__ import annotations
 
 import time
 from typing import Any, Iterable

@@ -4,6 +4,7 @@ Created on Wed Jun  3 20:04:03 2026
 
 @author: Aadi
 """
+from __future__ import annotations
 
 """
 Lights: 4-channel USB HID relay (vendor 0x16c0, product 0x05df).
@@ -23,7 +24,6 @@ Three independent animation states that don't fight each other:
 robot_lock=true forces everything off and locks out further commands.
 HID auto-reconnects on USB transient errors.
 """
-from __future__ import annotations
 
 import threading
 import time

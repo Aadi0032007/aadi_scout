@@ -4,6 +4,8 @@ Created on Wed Jun  3 20:04:03 2026
 
 @author: Aadi
 """
+from __future__ import annotations
+
 
 """
 Daily streaming with PiP and badges.
@@ -23,7 +25,6 @@ Each outgoing frame is composed:
 robot_lock=True stops video and audio publishing entirely so the operator
 sees a frozen frame as visual confirmation of lock state. Same as original.
 """
-from __future__ import annotations
 
 import json
 import subprocess

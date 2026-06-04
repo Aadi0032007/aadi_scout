@@ -4,6 +4,7 @@ Created on Wed Jun  3 20:04:03 2026
 
 @author: Aadi
 """
+from __future__ import annotations
 
 """
 Session recorder — floor camera as H.264 MP4 + telemetry as JSONL.
@@ -29,7 +30,6 @@ First one that opens wins. All produce the same MP4 file format.
 robot_lock=True pauses recording (no frames consumed, no JSONL lines written)
 so the dataset contains only intentional driving.
 """
-from __future__ import annotations
 
 import json
 import os

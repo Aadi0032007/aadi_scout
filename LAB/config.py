@@ -4,6 +4,8 @@ Created on Wed Jun  3 20:04:03 2026
 
 @author: Aadi
 """
+from __future__ import annotations
+
 
 """
 LAB configuration — single source of truth for every tunable value.
@@ -19,7 +21,6 @@ Three UDP ports are bound:
 The operator code is unchanged — these match what the gamepad sender writes
 when invoked with `--robot ELEPHANT`.
 """
-from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field

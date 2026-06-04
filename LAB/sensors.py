@@ -4,6 +4,8 @@ Created on Wed Jun  3 20:04:03 2026
 
 @author: Aadi
 """
+from __future__ import annotations
+
 
 """
 Sensor readers — IMU (WIT/JY901 over UART) and GPS (NMEA over UART).
@@ -15,7 +17,6 @@ and exposes a latest-snapshot via get().
 IMU frames are 11 bytes: 0x55, frame_id, 8 payload, checksum.
 GPS sentences are standard NMEA + Unicore UM982 #ADRNAVA extensions.
 """
-from __future__ import annotations
 
 import math
 import threading
