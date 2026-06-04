@@ -104,31 +104,6 @@ class LabConfig:
         "ugreen", "u_green", "usb_audio", "usb-audio", "emeet", "alsa_input.usb-",
     ])
 
-    """
-    # ── Cameras ───────────────────────────────────────────────────────────────
-    cameras: list = field(default_factory=lambda: [
-        CameraConfig(
-            name="orbital",
-            source="rtsp://revolabs:revolabs123%40@192.168.10.50:554/h264Preview_01_main",
-            width=640, height=480, fps=15, rtsp_transport="tcp",
-        ),
-        CameraConfig(
-            name="ai_front",
-            source="rtsp://revolabs:revolabs123%40@192.168.10.52:554/revo_rear_ai_cam/realmonitor?channel=1&subtype=1",
-            width=640, height=480, fps=10, rtsp_transport="tcp",
-        ),
-        CameraConfig(
-            name="ai_back",
-            source="rtsp://revolabs:revolabs123%40@192.168.10.51:554/revo_front_ai_cam/realmonitor?channel=1&subtype=1",
-            width=640, height=480, fps=10, rtsp_transport="tcp",
-        ),
-        CameraConfig(
-            name="floor",
-            source="/dev/floor_cam",        # udev symlink — set this up in /etc/udev/rules.d
-            width=640, height=480, fps=15,
-        ),
-    ])"""
-
     # ── Cameras ───────────────────────────────────────────────────────────────
     cameras: list = field(default_factory=lambda: [
         # Orbital is on the network
@@ -213,8 +188,6 @@ class LabConfig:
     record_video_bitrate:   str   = "1500k"       # ffmpeg -b:v
     # Encoder preference order — first available wins. Auto-probed at startup.
     record_encoder_preference: list = field(default_factory=lambda: [
-        "h264_nvenc",      # Jetson NVIDIA hw encoder
-        "h264_v4l2m2m",    # Jetson V4L2 hw encoder
         "libx264",         # software fallback (still fast at 640x480@15)
     ])
 
