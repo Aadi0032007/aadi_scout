@@ -14,6 +14,11 @@ echo "[teleop_start] Checking for and killing lingering ROS 2 processes..."
 pkill -f "ros2 launch agv_pro_bringup" || true
 pkill -f "agv_pro_node" || true
 pkill -f "lslidar_driver_node" || true
+
+# NEW: Nuke the leftover FastDDS shared memory lock files
+echo "[teleop_start] Clearing FastDDS shared memory locks..."
+rm -rf /dev/shm/fastrtps* || true
+
 sleep 1 # Give the kernel a second to release the /dev/ hardware locks
 
 cleanup() {
