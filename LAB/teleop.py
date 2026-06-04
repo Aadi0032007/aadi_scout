@@ -25,6 +25,7 @@ Layout:
         → main tick: source arbitration, keyboard, shutdown
         → on exit: stop everything in reverse order
 """
+from _typeshed import _type_checker_internals
 from __future__ import annotations
 
 import argparse
@@ -434,6 +435,7 @@ def main() -> None:
         "b_pressed":     False,
         "button_8":      False,
         "speed_label":   None,
+        "rec_flag":      None, 
     }
 
     # ── Dispatchers ──────────────────────────────────────────────────────────
@@ -491,11 +493,17 @@ def main() -> None:
         prev_state["button_8"]  = button_8
 
         # --- UDP-initiated recording toggle ---
+        # Only act on edges (transitions), not steady-state values.
+        # Operator may resend "record": true at 50 Hz; we ignore repeats.
         rec_flag = pkt.get("record")
-        if rec_flag is True:
-            set_recording(True)
-        elif rec_flag is False:
-            set_recording(False)
+        if rec_flag is not None:
+            rec_flag = bool(rec_flag)
+            if rec_flag != prev_state.get("rec_flag"):
+                if rec_flag:
+                    set_recording(True)
+                else:
+                    set_recording(False)
+                prev_state["rec_flag"] = rec_flag
 
     def on_events_packet(pkt: dict, addr, port: int) -> None:
         """Port 57000 — lights, signals, audio volume, talk blink, music."""
