@@ -158,7 +158,7 @@ class LabConfig:
     stream_width:           int   = 640
     stream_height:          int   = 480
     stream_fps:             int   = 15
-    initial_main_source:    str   = "floor"   # which camera is shown on startup
+    initial_main_source:    str   = "ai_front"   # which camera is shown on startup
 
     # ── PiP thumbnails on the main stream ─────────────────────────────────────
     pip_enabled:            bool  = True
