@@ -18,10 +18,14 @@ Listens on three UDP ports (matches the unchanged operator wire format):
     57001  TTS text (type:"stt")
 
 Two command sources with priority arbitration:
-    1. Local USB dongle plugged into the Jetson (highest priority via evdev)
+    1. Local USB dongle plugged into the Jetson (highest priority via pygame).
+       Same controller mapping, same state machine, same packet schema as
+       the remote operator script — see LAB.local_gamepad.
     2. Remote gamepad over Tailscale (lower priority)
 
-Press 'r' to toggle recording, or send {"record": true|false} over UDP.
+Recording is auto-driven by robot_lock:
+    robot_lock True  → False  : start a new session
+    robot_lock False → True   : stop and finalize the session
 
 Layout:
     main()
@@ -29,8 +33,8 @@ Layout:
         → init rclpy ONCE (only motion uses it)
         → start cameras, sensors, motion, ptz, lights, audio, stream, recorder
         → bind three UDP listeners
-        → bind local evdev (optional)
-        → main tick: source arbitration, keyboard, shutdown
+        → start local pygame gamepad (optional)
+        → main wait loop, shutdown on signal
         → on exit: stop everything in reverse order
 """
 
@@ -49,16 +53,17 @@ _REPO = Path(__file__).resolve().parent.parent
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-from LAB.audio    import AudioController
-from LAB.cameras  import MultiCameraCapture
-from LAB.common   import first_float, log, now_mono, truthy
-from LAB.config   import LabConfig
-from LAB.lights   import LightsController
-from LAB.motion   import MotionController
-from LAB.ptz      import PtzController
-from LAB.record   import SessionRecorder
-from LAB.sensors  import GpsReader, ImuReader
-from LAB.stream   import DailyStream
+from LAB.audio         import AudioController
+from LAB.cameras       import MultiCameraCapture
+from LAB.common        import first_float, log, now_mono, truthy
+from LAB.config        import LabConfig
+from LAB.lights        import LightsController
+from LAB.local_gamepad import LocalGamepad
+from LAB.motion        import MotionController
+from LAB.ptz           import PtzController
+from LAB.record        import SessionRecorder
+from LAB.sensors       import GpsReader, ImuReader
+from LAB.stream        import DailyStream
 
 
 # ── UDP listener ──────────────────────────────────────────────────────────────
@@ -117,105 +122,6 @@ class UdpListener(threading.Thread):
         self._stop.set()
 
 
-# ── Local dongle (evdev) — highest priority command source ────────────────────
-
-class LocalDongleListener(threading.Thread):
-    """
-    Reads a USB gamepad plugged directly into the Jetson via evdev.
-    Translates evdev events into the same dict format the UDP gamepad sends,
-    then routes through the same dispatcher as remote packets — but tagged
-    with higher priority so it preempts the remote source.
-    """
-
-    def __init__(self, name_hints: list, on_packet) -> None:
-        super().__init__(daemon=True, name="local-dongle")
-        self._hints = [h.lower() for h in name_hints]
-        self._on_packet = on_packet
-        self._stop = threading.Event()
-        self._dev = None
-
-    def run(self) -> None:
-        try:
-            from evdev import InputDevice, list_devices, ecodes
-        except ImportError:
-            log("teleop", "evdev not installed — local dongle disabled (pip install evdev)")
-            return
-
-        while not self._stop.is_set():
-            self._dev = self._find_device(InputDevice, list_devices)
-            if self._dev is None:
-                self._stop.wait(timeout=2.0)
-                continue
-
-            log("teleop", f"local dongle connected: {self._dev.name}")
-
-            # Latest values that we re-emit as packets
-            lin_x = 0.0
-            ang_z = 0.0
-            head  = "center"
-            send_due = now_mono()
-
-            try:
-                for event in self._dev.read_loop():
-                    if self._stop.is_set():
-                        break
-
-                    if event.type == ecodes.EV_ABS:
-                        if event.code == ecodes.ABS_RZ:
-                            lin_x = self._normalize_axis(event.value)
-                        elif event.code == ecodes.ABS_Z:
-                            ang_z = -self._normalize_axis(event.value)
-                        elif event.code == ecodes.ABS_HAT0X:
-                            head = {"-1": "left", "1": "right", "0": "center"}[str(event.value)]
-                        elif event.code == ecodes.ABS_HAT0Y:
-                            head = {"-1": "up", "1": "down", "0": "center"}[str(event.value)]
-
-                    # Emit at ~25 Hz to match a comfortable rate without flooding
-                    if now_mono() >= send_due:
-                        send_due = now_mono() + 0.04
-                        pkt = {
-                            "lin_x":      lin_x,
-                            "ang_z":      ang_z,
-                            "head":       head,
-                            "robot_lock": False,    # local dongle is implicitly trusted
-                            "_local":     True,     # marker for the dispatcher
-                        }
-                        try:
-                            self._on_packet(pkt, ("local", 0), -1)
-                        except Exception as exc:
-                            log("teleop", f"local dispatch error: {exc}")
-
-            except OSError:
-                log("teleop", "local dongle disconnected")
-                self._dev = None
-
-    @staticmethod
-    def _normalize_axis(value: int) -> float:
-        """Map evdev axis [0..255, center 128] to [-1.0..+1.0] with deadzone."""
-        delta = value - 128
-        if abs(delta) < 6:
-            return 0.0
-        return max(-1.0, min(1.0, delta / 127.0))
-
-    def _find_device(self, InputDevice, list_devices):
-        """Find the first evdev device whose name matches a configured hint."""
-        for path in list_devices():
-            try:
-                dev = InputDevice(path)
-            except Exception:
-                continue
-            name_lc = (dev.name or "").lower()
-            if any(h in name_lc for h in self._hints):
-                # Skip keyboards / mice that may share name fragments
-                if any(x in name_lc for x in ("keyboard", "mouse", "consumer", "system")):
-                    continue
-                return dev
-        return None
-
-    def stop(self) -> None:
-        self._stop.set()
-
-
 # ── Source arbitration ────────────────────────────────────────────────────────
 
 class SourceArbiter:
@@ -261,31 +167,13 @@ class SourceArbiter:
         self._active = live[0][1]
 
 
-# ── Keyboard 'r' toggle ───────────────────────────────────────────────────────
-
-def start_keyboard_listener(on_r) -> Optional[object]:
-    try:
-        from pynput import keyboard
-    except ImportError:
-        log("teleop", "pynput not installed — 'r' toggle unavailable")
-        return None
-
-    def on_press(key):
-        if getattr(key, "char", None) == "r":
-            on_r()
-
-    listener = keyboard.Listener(on_press=on_press)
-    listener.daemon = True
-    listener.start()
-    return listener
-
-
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="REVO Scout LAB — unified controller")
     ap.add_argument("--env", default=None, help=".env file path (auto-detected)")
-    ap.add_argument("--no-local-dongle", action="store_true", help="Disable evdev local dongle")
+    ap.add_argument("--no-local-dongle", action="store_true",
+                    help="Disable the local pygame gamepad")
     args = ap.parse_args()
 
     cfg = LabConfig.load_secrets(args.env)
@@ -294,7 +182,8 @@ def main() -> None:
     log("teleop", f"cache_dir   = {cfg.cache_dir}")
     log("teleop", f"record_fps  = {cfg.record_fps}")
     log("teleop", f"stream_fps  = {cfg.stream_fps}")
-    log("teleop", f"ports       = motion:{cfg.udp_motion_port} events:{cfg.udp_events_port} tts:{cfg.udp_tts_port}")
+    log("teleop", f"ports       = motion:{cfg.udp_motion_port} "
+                  f"events:{cfg.udp_events_port} tts:{cfg.udp_tts_port}")
     log("teleop", "=" * 60)
 
     # ── Init ROS2 once for the whole process ─────────────────────────────────
@@ -407,18 +296,14 @@ def main() -> None:
 
     rec_lock = threading.Lock()
 
-    def toggle_recording() -> None:
-        with rec_lock:
-            if recorder.is_active():
-                recorder.stop()
-            else:
-                recorder.start()
-
     def set_recording(active: bool) -> None:
         with rec_lock:
             if active and not recorder.is_active():
                 recorder.start()
-            elif (not active) and recorder.is_active():
+            elif not active:
+                # Unconditional: recorder.stop() is idempotent and finalizes
+                # any open session even if an internal error already cleared
+                # self._active (e.g. ffmpeg pipe loss).
                 recorder.stop()
 
     # ── Source arbitration ───────────────────────────────────────────────────
@@ -432,22 +317,25 @@ def main() -> None:
     )
 
     # ── Per-source state for edge detection ──────────────────────────────────
-    # The orchestrator needs to track button states across packets to detect:
-    #   - A+B combo edge → ptz.capture_home()
-    #   - button==8 edge → ptz.goto_home()
-    #   - speed-label change → ptz.capture_home()
+    # Tracks button states across packets to detect:
+    #   - A+B combo edge       → ptz.capture_home()
+    #   - button==8 edge       → ptz.goto_home()
+    #   - speed-label change   → ptz.capture_home()
+    #   - robot_lock edge      → auto-start / auto-stop recording
+    # robot_lock defaults to True (robot starts locked) so the first packet
+    # carrying robot_lock=True is NOT treated as a transition.
     prev_state = {
-        "a_pressed":     False,
-        "b_pressed":     False,
-        "button_8":      False,
-        "speed_label":   None,
-        "rec_flag":      None, 
+        "a_pressed":   False,
+        "b_pressed":   False,
+        "button_8":    False,
+        "speed_label": None,
+        "robot_lock":  True,
     }
 
     # ── Dispatchers ──────────────────────────────────────────────────────────
 
     def on_motion_packet(pkt: dict, addr, port: int) -> None:
-        """Port 55999 — motion + head + camera + button. Also from local dongle."""
+        """Port 55999 — motion + head + camera + button. Also from local gamepad."""
         source = "local" if pkt.get("_local") else "remote"
         arbiter.report(source)
         if not arbiter.is_active(source):
@@ -462,7 +350,16 @@ def main() -> None:
         motion.command(lin, ang, locked, brake)
         lights.set_robot_lock(locked)
         stream.set_robot_lock(locked)
-        recorder.set_robot_lock(locked)
+
+        # --- robot_lock edge → start / stop recording ---
+        # Recording is now driven entirely by lock state: each unlock period
+        # produces one session under cfg.cache_dir.
+        if locked != prev_state["robot_lock"]:
+            if not locked:
+                set_recording(True)
+            else:
+                set_recording(False)
+            prev_state["robot_lock"] = locked
 
         # --- camera switch ---
         cam = pkt.get("camera") or pkt.get("cam") or pkt.get("video_source")
@@ -497,19 +394,6 @@ def main() -> None:
         prev_state["a_pressed"] = a_pressed
         prev_state["b_pressed"] = b_pressed
         prev_state["button_8"]  = button_8
-
-        # --- UDP-initiated recording toggle ---
-        # Only act on edges (transitions), not steady-state values.
-        # Operator may resend "record": true at 50 Hz; we ignore repeats.
-        rec_flag = pkt.get("record")
-        if rec_flag is not None:
-            rec_flag = bool(rec_flag)
-            if rec_flag != prev_state.get("rec_flag"):
-                if rec_flag:
-                    set_recording(True)
-                else:
-                    set_recording(False)
-                prev_state["rec_flag"] = rec_flag
 
     def on_events_packet(pkt: dict, addr, port: int) -> None:
         """Port 57000 — lights, signals, audio volume, talk blink, music."""
@@ -546,12 +430,17 @@ def main() -> None:
     udp_events.start()
     udp_tts.start()
 
-    local: Optional[LocalDongleListener] = None
+    # ── Local pygame gamepad — mirrors operator script ───────────────────────
+    local: Optional[LocalGamepad] = None
     if cfg.local_dongle_enabled and not args.no_local_dongle:
-        local = LocalDongleListener(cfg.local_dongle_name_hints, on_motion_packet)
+        local = LocalGamepad(
+            on_motion          = on_motion_packet,
+            on_events          = on_events_packet,
+            on_tts             = on_tts_packet,
+            initial_robot_lock = True,
+            priority_value     = cfg.local_dongle_priority,
+        )
         local.start()
-
-    kb = start_keyboard_listener(toggle_recording)
 
     # ── Signal handling and main wait ─────────────────────────────────────────
 
@@ -564,31 +453,25 @@ def main() -> None:
     signal.signal(signal.SIGINT,  on_signal)
     signal.signal(signal.SIGTERM, on_signal)
 
-    log("teleop", "ready — 'r' to toggle recording, Ctrl-C to quit")
+    log("teleop", "ready — recording auto-starts on unlock; Ctrl-C to quit")
 
     try:
-        try:
-            while running.is_set():
-                time.sleep(0.5)
-        except KeyboardInterrupt:
-            pass
-    finally:
-        # ── Shutdown ─────────────────────────────────────────────────────────────
-        log("teleop", "shutting down…")
-
-        try:
-            if recorder.is_active():
-                recorder.stop()
-        except Exception as exc:
-            log("teleop", f"recorder stop error: {exc}")
+        while running.is_set():
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        pass
 
     # ── Shutdown ─────────────────────────────────────────────────────────────
 
     log("teleop", "shutting down…")
 
+    # Finalize any in-progress recording first so the MP4 + session.json are
+    # written while cameras + sensors are still alive. Called unconditionally —
+    # recorder.stop() is a no-op if no session is open, and DOES write
+    # session.json even when an internal error already cleared self._active
+    # (e.g. ffmpeg pipe loss mid-session).
     try:
-        if recorder.is_active():
-            recorder.stop()
+        recorder.stop()
     except Exception as exc:
         log("teleop", f"recorder stop error: {exc}")
 
@@ -597,7 +480,6 @@ def main() -> None:
         ("udp_events", udp_events),
         ("udp_tts",    udp_tts),
         ("local",      local),
-        ("kb",         kb),
         ("stream",     stream),
         ("ptz",        ptz),
         ("lights",     lights),

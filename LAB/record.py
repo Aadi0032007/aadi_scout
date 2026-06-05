@@ -112,9 +112,21 @@ class SessionRecorder:
         return True
 
     def stop(self) -> None:
-        """Stop recording, flush video + jsonl, close the session."""
-        if not self._active:
+        """Stop recording, flush video + jsonl, close the session.
+
+        Idempotent and robust to internal errors. As long as a session folder
+        was opened (`_session_dir is not None`), this method will finalize
+        whatever's still alive — ffmpeg pipe, jsonl handle — and ALWAYS write
+        session.json. That includes the cases where:
+            - the ffmpeg pipe died mid-session and self._active is already False
+            - the tick thread has already exited on its own
+            - stop() is being called twice in a row (e.g. lock edge then Ctrl-C)
+        Calling stop() before any session was opened is a no-op.
+        """
+        # Nothing to finalize if a session was never opened
+        if self._session_dir is None:
             return
+
         self._active = False
         self._stop.set()
 
@@ -129,7 +141,10 @@ class SessionRecorder:
         if self._ffmpeg is not None:
             try:
                 if self._ffmpeg.stdin is not None:
-                    self._ffmpeg.stdin.close()
+                    try:
+                        self._ffmpeg.stdin.close()
+                    except Exception:
+                        pass
                 self._ffmpeg.wait(timeout=10)
             except Exception:
                 try:
@@ -147,8 +162,23 @@ class SessionRecorder:
                     pass
                 self._jsonl_file = None
 
-        self._write_session_metadata()
+        # Always attempt to write session.json — this is the user-visible
+        # marker that a session ended cleanly.
+        try:
+            self._write_session_metadata()
+        except Exception as exc:
+            log("record", f"session.json write error: {exc}")
+
         log("record", f"■  stopped — {self._frame_index} frames → {self._session_dir}")
+
+        # Reset session-scoped state so a subsequent start() opens a fresh one
+        self._session_dir   = None
+        self._video_path    = None
+        self._jsonl_path    = None
+        self._encoder_used  = None
+        self._frame_index   = 0
+        self._start_unix    = 0.0
+        self._start_mono    = 0.0
 
     def set_robot_lock(self, locked: bool) -> None:
         """When True, pause frame consumption and JSONL writes."""
