@@ -168,7 +168,7 @@ class DailyStream:
                     },
                     "publishing": {
                         "camera":     {"isPublishing": True},
-                        "microphone": {"isPublishing": self._mic_device is None},
+                        "microphone": {"isPublishing": self._mic_device is not None},
                     },
                 },
             )
