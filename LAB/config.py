@@ -129,15 +129,15 @@ class LabConfig:
         # Rear AI camera is on USB (fallback to /dev/videoX if you don't have the exact by-id path)
         CameraConfig(
             name="ai_back",
-            source="/dev/video2", # You might need to change this to video0 or video1 depending on how Ubuntu enumerates them
+            source="/dev/v4l/by-id/usb-HD_Camera_Manufacturer_HD_USB_Camera_2020101401-video-index0", # You might need to change this to video0 or video1 depending on how Ubuntu enumerates them
             width=640, height=480, fps=15,
         ),
         # Floor camera is on USB
-        CameraConfig(
-            name="floor",
-            source="/dev/floor_cam",        
-            width=640, height=480, fps=15,
-        ),
+        # CameraConfig(
+        #     name="floor",
+        #     source="/dev/floor_cam",        
+        #     width=640, height=480, fps=15,
+        # ),
     ])
 
     # The gamepad sends these camera names. Map them to our internal names above.
@@ -164,9 +164,9 @@ class LabConfig:
     pip_enabled:            bool  = True
     pip_left_source:        str   = "orbital"     # pilot on left
     pip_right_source:       str   = "ai_back"     # rear on right
-    pip_width:              int   = 192
-    pip_height:             int   = 144
-    pip_margin:             int   = 12
+    pip_width:              int   = 160
+    pip_height:             int   = 120
+    pip_margin:             int   = 10
     pip_gap:                int   = 8
     pip_stale_sec:          float = 0.60          # drop thumbnails older than this
     pip_show_label:         bool  = False
