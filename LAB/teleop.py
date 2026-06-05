@@ -9,28 +9,34 @@ from __future__ import annotations
 """
 REVO Scout LAB — unified controller and recorder.
 
-Final behavior:
+Single Python process. Replaces all separate systemd services from the
+original architecture. Operator gamepad code is unchanged on the PC side.
 
-    Stream:
-        starts once at boot
-        stays alive during lock/unlock
-        stops only on shutdown
+Listens on three UDP ports (matches the unchanged operator wire format):
+    55999  motion + head + camera + button + robot_lock
+    57000  lights / signals / audio / talk / music events
+    57001  TTS text (type:"stt")
 
-    Recording:
-        stable unlock -> start fresh recording session
-        stable lock   -> stop/finalize recording session
+Two command sources with priority arbitration:
+    1. Local USB dongle plugged into the Jetson (highest priority via evdev)
+    2. Remote gamepad over Tailscale (lower priority)
 
-    Lock parsing:
-        robot_lock / lock is treated as a STATE, not an event.
-        Missing lock field keeps the previous known state.
-        Stable debounce prevents flicker from repeatedly starting/stopping recording.
+Press 'r' to toggle recording, or send {"record": true|false} over UDP.
 
-This restores the old seamless streaming behavior while still giving a new
-recording session for every unlock period.
+Layout:
+    main()
+        → load config + secrets
+        → init rclpy ONCE (only motion uses it)
+        → start cameras, sensors, motion, ptz, lights, audio, stream, recorder
+        → bind three UDP listeners
+        → bind local evdev (optional)
+        → main tick: source arbitration, keyboard, shutdown
+        → on exit: stop everything in reverse order
 """
 
 import argparse
 import json
+import os
 import signal
 import socket
 import sys
@@ -43,23 +49,22 @@ _REPO = Path(__file__).resolve().parent.parent
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-from LAB.audio         import AudioController
-from LAB.cameras       import MultiCameraCapture
-from LAB.common        import first_float, log, now_mono, truthy
-from LAB.config        import LabConfig
-from LAB.lights        import LightsController
-from LAB.local_gamepad import LocalGamepad
-from LAB.motion        import MotionController
-from LAB.ptz           import PtzController
-from LAB.record        import SessionRecorder
-from LAB.sensors       import GpsReader, ImuReader
-from LAB.stream        import DailyStream
+from LAB.audio    import AudioController
+from LAB.cameras  import MultiCameraCapture
+from LAB.common   import first_float, log, now_mono, truthy
+from LAB.config   import LabConfig
+from LAB.lights   import LightsController
+from LAB.motion   import MotionController
+from LAB.ptz      import PtzController
+from LAB.record   import SessionRecorder
+from LAB.sensors  import GpsReader, ImuReader
+from LAB.stream   import DailyStream
 
 
 # ── UDP listener ──────────────────────────────────────────────────────────────
 
 class UdpListener(threading.Thread):
-    """One UDP port → one callback."""
+    """One UDP port → one callback. Used three times for the three ports."""
 
     def __init__(self, host: str, port: int, label: str, on_packet) -> None:
         super().__init__(daemon=True, name=f"udp-{label}")
@@ -112,23 +117,119 @@ class UdpListener(threading.Thread):
         self._stop.set()
 
 
+# ── Local dongle (evdev) — highest priority command source ────────────────────
+
+class LocalDongleListener(threading.Thread):
+    """
+    Reads a USB gamepad plugged directly into the Jetson via evdev.
+    Translates evdev events into the same dict format the UDP gamepad sends,
+    then routes through the same dispatcher as remote packets — but tagged
+    with higher priority so it preempts the remote source.
+    """
+
+    def __init__(self, name_hints: list, on_packet) -> None:
+        super().__init__(daemon=True, name="local-dongle")
+        self._hints = [h.lower() for h in name_hints]
+        self._on_packet = on_packet
+        self._stop = threading.Event()
+        self._dev = None
+
+    def run(self) -> None:
+        try:
+            from evdev import InputDevice, list_devices, ecodes
+        except ImportError:
+            log("teleop", "evdev not installed — local dongle disabled (pip install evdev)")
+            return
+
+        while not self._stop.is_set():
+            self._dev = self._find_device(InputDevice, list_devices)
+            if self._dev is None:
+                self._stop.wait(timeout=2.0)
+                continue
+
+            log("teleop", f"local dongle connected: {self._dev.name}")
+
+            # Latest values that we re-emit as packets
+            lin_x = 0.0
+            ang_z = 0.0
+            head  = "center"
+            send_due = now_mono()
+
+            try:
+                for event in self._dev.read_loop():
+                    if self._stop.is_set():
+                        break
+
+                    if event.type == ecodes.EV_ABS:
+                        if event.code == ecodes.ABS_RZ:
+                            lin_x = self._normalize_axis(event.value)
+                        elif event.code == ecodes.ABS_Z:
+                            ang_z = -self._normalize_axis(event.value)
+                        elif event.code == ecodes.ABS_HAT0X:
+                            head = {"-1": "left", "1": "right", "0": "center"}[str(event.value)]
+                        elif event.code == ecodes.ABS_HAT0Y:
+                            head = {"-1": "up", "1": "down", "0": "center"}[str(event.value)]
+
+                    # Emit at ~25 Hz to match a comfortable rate without flooding
+                    if now_mono() >= send_due:
+                        send_due = now_mono() + 0.04
+                        pkt = {
+                            "lin_x":      lin_x,
+                            "ang_z":      ang_z,
+                            "head":       head,
+                            "robot_lock": False,    # local dongle is implicitly trusted
+                            "_local":     True,     # marker for the dispatcher
+                        }
+                        try:
+                            self._on_packet(pkt, ("local", 0), -1)
+                        except Exception as exc:
+                            log("teleop", f"local dispatch error: {exc}")
+
+            except OSError:
+                log("teleop", "local dongle disconnected")
+                self._dev = None
+
+    @staticmethod
+    def _normalize_axis(value: int) -> float:
+        """Map evdev axis [0..255, center 128] to [-1.0..+1.0] with deadzone."""
+        delta = value - 128
+        if abs(delta) < 6:
+            return 0.0
+        return max(-1.0, min(1.0, delta / 127.0))
+
+    def _find_device(self, InputDevice, list_devices):
+        """Find the first evdev device whose name matches a configured hint."""
+        for path in list_devices():
+            try:
+                dev = InputDevice(path)
+            except Exception:
+                continue
+            name_lc = (dev.name or "").lower()
+            if any(h in name_lc for h in self._hints):
+                # Skip keyboards / mice that may share name fragments
+                if any(x in name_lc for x in ("keyboard", "mouse", "consumer", "system")):
+                    continue
+                return dev
+        return None
+
+    def stop(self) -> None:
+        self._stop.set()
+
+
 # ── Source arbitration ────────────────────────────────────────────────────────
 
 class SourceArbiter:
     """
-    Tracks active command source.
-
-    Lower priority number wins.
-    Example:
-        local  = 100
-        remote = 200
+    Tracks which command source is currently active. Lower priority number wins.
+    If the winning source goes silent for `timeout_sec`, the next-priority active
+    source takes over.
     """
 
     def __init__(self, priorities: dict, timeout_sec: float) -> None:
-        self._priorities = dict(priorities)
-        self._timeout = timeout_sec
+        self._priorities  = dict(priorities)            # {"local": 100, "remote": 200}
+        self._timeout     = timeout_sec
         self._last_seen: dict = {k: 0.0 for k in priorities}
-        self._lock = threading.Lock()
+        self._lock        = threading.Lock()
         self._active: Optional[str] = None
 
     def report(self, source: str) -> None:
@@ -148,165 +249,43 @@ class SourceArbiter:
 
     def _update_active_locked(self) -> None:
         now = now_mono()
-
         live = [
             (self._priorities[s], s)
             for s, ts in self._last_seen.items()
             if (now - ts) <= self._timeout
         ]
-
         if not live:
             self._active = None
             return
-
-        live.sort()
+        live.sort()                  # lowest priority wins
         self._active = live[0][1]
 
 
-# ── Lock parsing ──────────────────────────────────────────────────────────────
+# ── Keyboard 'r' toggle ───────────────────────────────────────────────────────
 
-def parse_lock_state(pkt: dict, last_known_locked: bool) -> tuple[bool, bool]:
-    """
-    Return:
-        locked, lock_field_present
+def start_keyboard_listener(on_r) -> Optional[object]:
+    try:
+        from pynput import keyboard
+    except ImportError:
+        log("teleop", "pynput not installed — 'r' toggle unavailable")
+        return None
 
-    This avoids the bad pattern:
+    def on_press(key):
+        if getattr(key, "char", None) == "r":
+            on_r()
 
-        truthy(pkt.get("robot_lock") or pkt.get("lock"))
-
-    because that can misread False/missing values.
-
-    If robot_lock / lock is missing, we keep the previous lock state.
-    """
-    if "robot_lock" in pkt:
-        return truthy(pkt["robot_lock"]), True
-
-    if "lock" in pkt:
-        return truthy(pkt["lock"]), True
-
-    return last_known_locked, False
-
-
-# ── Recording manager ─────────────────────────────────────────────────────────
-
-class RecordingManager(threading.Thread):
-    """
-    Controls recording only.
-
-    Stream is NOT controlled here.
-    Stream stays alive continuously for seamless viewing.
-
-    Stable unlock:
-        start a fresh recording session
-
-    Stable lock:
-        stop/finalize current recording session
-    """
-
-    def __init__(
-        self,
-        recorder: SessionRecorder,
-        debounce_sec: float = 0.75,
-    ) -> None:
-        super().__init__(daemon=True, name="record-manager")
-        self._recorder = recorder
-        self._debounce_sec = debounce_sec
-
-        self._cv = threading.Condition()
-        self._stop_thread = False
-
-        # Robot starts locked.
-        self._desired_locked = True
-        self._applied_locked = True
-        self._last_change = time.monotonic()
-
-    def set_robot_lock(self, locked: bool) -> None:
-        locked = bool(locked)
-
-        with self._cv:
-            if locked == self._desired_locked:
-                return
-
-            self._desired_locked = locked
-            self._last_change = time.monotonic()
-            self._cv.notify()
-
-    def run(self) -> None:
-        while True:
-            with self._cv:
-                if self._stop_thread:
-                    break
-
-                if self._desired_locked == self._applied_locked:
-                    self._cv.wait(timeout=0.25)
-                    continue
-
-                stable_for = time.monotonic() - self._last_change
-                wait_for = self._debounce_sec - stable_for
-
-                if wait_for > 0:
-                    self._cv.wait(timeout=wait_for)
-                    continue
-
-                target_locked = self._desired_locked
-
-            try:
-                if target_locked:
-                    self._apply_locked()
-                else:
-                    self._apply_unlocked()
-            except Exception as exc:
-                log("teleop", f"record manager error: {exc}")
-
-            with self._cv:
-                self._applied_locked = target_locked
-
-    def _apply_unlocked(self) -> None:
-        log("teleop", "stable unlock — starting new recording session")
-
-        try:
-            if not self._recorder.is_active():
-                self._recorder.set_robot_lock(False)
-                self._recorder.start()
-        except Exception as exc:
-            log("teleop", f"recorder start error: {exc}")
-
-    def _apply_locked(self) -> None:
-        log("teleop", "stable lock — stopping recording session")
-
-        try:
-            self._recorder.set_robot_lock(True)
-            self._recorder.stop()
-        except Exception as exc:
-            log("teleop", f"recorder stop error: {exc}")
-
-    def stop(self) -> None:
-        with self._cv:
-            self._stop_thread = True
-            self._cv.notify()
-
-        try:
-            self.join(timeout=2.0)
-        except Exception:
-            pass
-
-        try:
-            self._recorder.set_robot_lock(True)
-            self._recorder.stop()
-        except Exception as exc:
-            log("teleop", f"final recorder stop error: {exc}")
+    listener = keyboard.Listener(on_press=on_press)
+    listener.daemon = True
+    listener.start()
+    return listener
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="REVO Scout LAB — unified controller")
-    ap.add_argument("--env", default=None, help=".env file path, auto-detected if omitted")
-    ap.add_argument(
-        "--no-local-dongle",
-        action="store_true",
-        help="Disable the local pygame gamepad",
-    )
+    ap.add_argument("--env", default=None, help=".env file path (auto-detected)")
+    ap.add_argument("--no-local-dongle", action="store_true", help="Disable evdev local dongle")
     args = ap.parse_args()
 
     cfg = LabConfig.load_secrets(args.env)
@@ -315,15 +294,10 @@ def main() -> None:
     log("teleop", f"cache_dir   = {cfg.cache_dir}")
     log("teleop", f"record_fps  = {cfg.record_fps}")
     log("teleop", f"stream_fps  = {cfg.stream_fps}")
-    log(
-        "teleop",
-        f"ports       = motion:{cfg.udp_motion_port} "
-        f"events:{cfg.udp_events_port} tts:{cfg.udp_tts_port}",
-    )
+    log("teleop", f"ports       = motion:{cfg.udp_motion_port} events:{cfg.udp_events_port} tts:{cfg.udp_tts_port}")
     log("teleop", "=" * 60)
 
-    # ── Init ROS2 once ───────────────────────────────────────────────────────
-
+    # ── Init ROS2 once for the whole process ─────────────────────────────────
     rclpy_inited = False
     try:
         import rclpy
@@ -332,7 +306,7 @@ def main() -> None:
     except ImportError:
         log("teleop", "rclpy not available — motion will be disabled")
 
-    # ── Start core subsystems ────────────────────────────────────────────────
+    # ── Start subsystems in dependency order ─────────────────────────────────
 
     cameras = MultiCameraCapture.from_configs(cfg.cameras)
 
@@ -343,200 +317,177 @@ def main() -> None:
     gps.start()
 
     motion = MotionController(
-        topic=cfg.cmd_vel_topic,
-        publish_hz=cfg.motion_publish_hz,
-        watchdog_sec=cfg.motion_watchdog_sec,
-        ang_z_scale=cfg.ang_z_scale,
+        topic         = cfg.cmd_vel_topic,
+        publish_hz    = cfg.motion_publish_hz,
+        watchdog_sec  = cfg.motion_watchdog_sec,
+        ang_z_scale   = cfg.ang_z_scale,
     )
     motion.start()
 
     audio = AudioController(
-        piper_model=cfg.piper_model,
-        music_dir=cfg.music_dir,
-        music_tracks=cfg.music_tracks,
-        startup_volume_pct=cfg.startup_volume_pct,
-        preferred_sink_patterns=cfg.preferred_sink_patterns,
-        preferred_source_patterns=cfg.preferred_source_patterns,
-        piper_speaker_id=cfg.piper_speaker_id,
+        piper_model               = cfg.piper_model,
+        music_dir                 = cfg.music_dir,
+        music_tracks              = cfg.music_tracks,
+        startup_volume_pct        = cfg.startup_volume_pct,
+        preferred_sink_patterns   = cfg.preferred_sink_patterns,
+        preferred_source_patterns = cfg.preferred_source_patterns,
+        piper_speaker_id          = cfg.piper_speaker_id,
     )
     audio.start()
 
     lights = LightsController(
-        blink_period_sec=cfg.blink_period_sec,
-        signal_timeout_sec=cfg.signal_timeout_sec,
-        talk_default_duration=cfg.talk_default_duration,
-        all_lights_cooldown_sec=cfg.all_lights_cooldown_sec,
-        all_lights_blink_sec=cfg.all_lights_blink_sec,
+        blink_period_sec        = cfg.blink_period_sec,
+        signal_timeout_sec      = cfg.signal_timeout_sec,
+        talk_default_duration   = cfg.talk_default_duration,
+        all_lights_cooldown_sec = cfg.all_lights_cooldown_sec,
+        all_lights_blink_sec    = cfg.all_lights_blink_sec,
     )
     lights.start()
 
     ptz = PtzController(
-        ip=cfg.ptz_ip,
-        port=cfg.ptz_port,
-        user=cfg.ptz_user,
-        password=cfg.ptz_password or "",
-        pan_speed=cfg.ptz_pan_speed,
-        tilt_speed=cfg.ptz_tilt_speed,
-        loop_hz=cfg.ptz_loop_hz,
-        deadband_sec=cfg.ptz_deadband_sec,
-        stop_after_sec=cfg.ptz_stop_after_sec,
+        ip             = cfg.ptz_ip,
+        port           = cfg.ptz_port,
+        user           = cfg.ptz_user,
+        password       = cfg.ptz_password or "",
+        pan_speed      = cfg.ptz_pan_speed,
+        tilt_speed     = cfg.ptz_tilt_speed,
+        loop_hz        = cfg.ptz_loop_hz,
+        deadband_sec   = cfg.ptz_deadband_sec,
+        stop_after_sec = cfg.ptz_stop_after_sec,
     )
     ptz.start()
-    ptz.set_ptz_unlock_state(True)
-
-    # ── Stream starts once and stays alive ───────────────────────────────────
-    #
-    # This is the old seamless behavior.
-    # Do NOT stop/start stream on lock/unlock.
+    ptz.set_ptz_unlock_state(True)   # PTZ is independently unlocked; can pan even when robot is locked
 
     stream = DailyStream(
-        api_key=cfg.daily_api_key,
-        room_url=cfg.daily_room_url,
-        room_name=cfg.daily_room_name,
-        width=cfg.stream_width,
-        height=cfg.stream_height,
-        fps=cfg.stream_fps,
-        cameras=cameras,
-        name_aliases=cfg.camera_name_aliases,
-        initial_main_source=cfg.initial_main_source,
-        pip_enabled=cfg.pip_enabled,
-        pip_left_source=cfg.pip_left_source,
-        pip_right_source=cfg.pip_right_source,
-        pip_width=cfg.pip_width,
-        pip_height=cfg.pip_height,
-        pip_margin=cfg.pip_margin,
-        pip_gap=cfg.pip_gap,
-        pip_stale_sec=cfg.pip_stale_sec,
-        pip_show_label=cfg.pip_show_label,
-        overlay_speed_badge=cfg.overlay_speed_badge,
-        overlay_camera_name=cfg.overlay_camera_name,
-        overlay_timestamp=cfg.overlay_timestamp,
-        mic_rtsp_url=cfg.mic_rtsp_url,
-        mic_rtsp_transport=cfg.mic_rtsp_transport,
-        mic_sample_rate=cfg.mic_sample_rate,
-        mic_channels=cfg.mic_channels,
-        mic_frame_ms=cfg.mic_frame_ms,
-        motion_state_fn=motion.state,
+        api_key             = cfg.daily_api_key,
+        room_url            = cfg.daily_room_url,
+        room_name           = cfg.daily_room_name,
+        width               = cfg.stream_width,
+        height              = cfg.stream_height,
+        fps                 = cfg.stream_fps,
+        cameras             = cameras,
+        name_aliases        = cfg.camera_name_aliases,
+        initial_main_source = cfg.initial_main_source,
+        pip_enabled         = cfg.pip_enabled,
+        pip_left_source     = cfg.pip_left_source,
+        pip_right_source    = cfg.pip_right_source,
+        pip_width           = cfg.pip_width,
+        pip_height          = cfg.pip_height,
+        pip_margin          = cfg.pip_margin,
+        pip_gap             = cfg.pip_gap,
+        pip_stale_sec       = cfg.pip_stale_sec,
+        pip_show_label      = cfg.pip_show_label,
+        overlay_speed_badge = cfg.overlay_speed_badge,
+        overlay_camera_name = cfg.overlay_camera_name,
+        overlay_timestamp   = cfg.overlay_timestamp,
+        mic_rtsp_url        = cfg.mic_rtsp_url,
+        mic_rtsp_transport  = cfg.mic_rtsp_transport,
+        mic_sample_rate     = cfg.mic_sample_rate,
+        mic_channels        = cfg.mic_channels,
+        mic_frame_ms        = cfg.mic_frame_ms,
+        motion_state_fn     = motion.state,
     )
     stream.start()
-    stream.set_robot_lock(True)
-
-    # ── Recorder starts/stops by debounced lock state ────────────────────────
 
     recorder = SessionRecorder(
-        base_dir=cfg.cache_dir,
-        camera_name=cfg.record_camera_name,
-        cameras=cameras,
-        width=cfg.record_width,
-        height=cfg.record_height,
-        fps=cfg.record_fps,
-        video_bitrate=cfg.record_video_bitrate,
-        encoder_preference=cfg.record_encoder_preference,
-        motion_state_fn=motion.state,
-        imu_get_fn=imu.get,
-        gps_get_fn=gps.get,
+        base_dir           = cfg.cache_dir,
+        camera_name        = cfg.record_camera_name,
+        cameras            = cameras,
+        width              = cfg.record_width,
+        height             = cfg.record_height,
+        fps                = cfg.record_fps,
+        video_bitrate      = cfg.record_video_bitrate,
+        encoder_preference = cfg.record_encoder_preference,
+        motion_state_fn    = motion.state,
+        imu_get_fn         = imu.get,
+        gps_get_fn         = gps.get,
     )
-    recorder.set_robot_lock(True)
 
-    record_manager = RecordingManager(
-        recorder=recorder,
-        debounce_sec=0.75,
-    )
-    record_manager.start()
+    # ── Recording control ─────────────────────────────────────────────────────
+
+    rec_lock = threading.Lock()
+
+    def toggle_recording() -> None:
+        with rec_lock:
+            if recorder.is_active():
+                recorder.stop()
+            else:
+                recorder.start()
+
+    def set_recording(active: bool) -> None:
+        with rec_lock:
+            if active and not recorder.is_active():
+                recorder.start()
+            elif (not active) and recorder.is_active():
+                recorder.stop()
 
     # ── Source arbitration ───────────────────────────────────────────────────
 
     arbiter = SourceArbiter(
-        priorities={
-            "local": cfg.local_dongle_priority,
+        priorities = {
+            "local":  cfg.local_dongle_priority,
             "remote": cfg.remote_gamepad_priority,
         },
-        timeout_sec=cfg.source_activity_timeout_sec,
+        timeout_sec = cfg.source_activity_timeout_sec,
     )
 
-    # Edge-detection state.
+    # ── Per-source state for edge detection ──────────────────────────────────
+    # The orchestrator needs to track button states across packets to detect:
+    #   - A+B combo edge → ptz.capture_home()
+    #   - button==8 edge → ptz.goto_home()
+    #   - speed-label change → ptz.capture_home()
     prev_state = {
-        "a_pressed": False,
-        "b_pressed": False,
-        "button_8": False,
-        "speed_label": None,
-    }
-
-    # Last known robot lock state.
-    # Robot starts locked.
-    lock_state = {
-        "locked": True,
+        "a_pressed":     False,
+        "b_pressed":     False,
+        "button_8":      False,
+        "speed_label":   None,
+        "rec_flag":      None, 
     }
 
     # ── Dispatchers ──────────────────────────────────────────────────────────
 
     def on_motion_packet(pkt: dict, addr, port: int) -> None:
-        """Port 55999 — motion + head + camera + button. Also from local gamepad."""
+        """Port 55999 — motion + head + camera + button. Also from local dongle."""
         source = "local" if pkt.get("_local") else "remote"
-
         arbiter.report(source)
-
         if not arbiter.is_active(source):
             return
 
-        # Safe lock parsing.
-        locked, lock_present = parse_lock_state(pkt, lock_state["locked"])
-
-        if lock_present and locked != lock_state["locked"]:
-            log(
-                "teleop",
-                f"lock edge from {source} addr={addr}: "
-                f"{lock_state['locked']} -> {locked} "
-                f"raw_robot_lock={pkt.get('robot_lock', '<missing>')} "
-                f"raw_lock={pkt.get('lock', '<missing>')}",
-            )
-
-        lock_state["locked"] = locked
-
-        # Motion.
-        lin = first_float(pkt, ("lin_x", "linx", "linear_x"))
-        ang = first_float(pkt, ("ang_z", "angz", "angular_z"))
-        brake = first_float(pkt, ("brake",), default=0.0) > cfg.brake_threshold
+        # --- motion gates ---
+        lin    = first_float(pkt, ("lin_x", "linx", "linear_x"))
+        ang    = first_float(pkt, ("ang_z", "angz", "angular_z"))
+        locked = truthy(pkt.get("robot_lock") or pkt.get("lock"))
+        brake  = first_float(pkt, ("brake",), default=0.0) > cfg.brake_threshold
 
         motion.command(lin, ang, locked, brake)
-
-        # Lock state to subsystems.
         lights.set_robot_lock(locked)
         stream.set_robot_lock(locked)
+        recorder.set_robot_lock(locked)
 
-        # Recording session starts/stops only on debounced lock state.
-        # Missing lock field does not cause a false edge.
-        if lock_present:
-            record_manager.set_robot_lock(locked)
-
-        # Camera switch.
+        # --- camera switch ---
         cam = pkt.get("camera") or pkt.get("cam") or pkt.get("video_source")
         if cam:
-            try:
-                stream.switch_source(str(cam))
-            except Exception as exc:
-                log("teleop", f"stream camera switch error: {exc}")
+            stream.switch_source(str(cam))
 
-        # PTZ direction.
+        # --- head / PTZ direction ---
         head = pkt.get("head")
         if head:
             ptz.command(str(head))
 
-        # Speed cycle → capture PTZ home.
+        # --- speed-cycle capture-home detection ---
         speed_label = pkt.get("speed")
         if speed_label and speed_label != prev_state["speed_label"]:
             if prev_state["speed_label"] is not None:
                 ptz.capture_home()
             prev_state["speed_label"] = speed_label
 
-        # Button edges → PTZ home actions.
+        # --- button edges → PTZ home actions ---
         a_pressed = truthy(pkt.get("a", False)) or pkt.get("button") == 1
         b_pressed = truthy(pkt.get("b", False)) or pkt.get("button") == 2
-        button_8 = pkt.get("button") == cfg.ptz_home_button
+        button_8  = pkt.get("button") == cfg.ptz_home_button
 
         ab_combo = a_pressed and b_pressed
-        prev_ab = prev_state["a_pressed"] and prev_state["b_pressed"]
-
+        prev_ab  = prev_state["a_pressed"] and prev_state["b_pressed"]
         if ab_combo and not prev_ab:
             ptz.capture_home()
 
@@ -545,7 +496,20 @@ def main() -> None:
 
         prev_state["a_pressed"] = a_pressed
         prev_state["b_pressed"] = b_pressed
-        prev_state["button_8"] = button_8
+        prev_state["button_8"]  = button_8
+
+        # --- UDP-initiated recording toggle ---
+        # Only act on edges (transitions), not steady-state values.
+        # Operator may resend "record": true at 50 Hz; we ignore repeats.
+        rec_flag = pkt.get("record")
+        if rec_flag is not None:
+            rec_flag = bool(rec_flag)
+            if rec_flag != prev_state.get("rec_flag"):
+                if rec_flag:
+                    set_recording(True)
+                else:
+                    set_recording(False)
+                prev_state["rec_flag"] = rec_flag
 
     def on_events_packet(pkt: dict, addr, port: int) -> None:
         """Port 57000 — lights, signals, audio volume, talk blink, music."""
@@ -573,99 +537,78 @@ def main() -> None:
             if text:
                 audio.speak(str(text))
 
-    # ── Start UDP listeners ──────────────────────────────────────────────────
+    # ── Start listeners ──────────────────────────────────────────────────────
 
-    udp_motion = UdpListener(
-        cfg.udp_listen_ip,
-        cfg.udp_motion_port,
-        "motion",
-        on_motion_packet,
-    )
-    udp_events = UdpListener(
-        cfg.udp_listen_ip,
-        cfg.udp_events_port,
-        "events",
-        on_events_packet,
-    )
-    udp_tts = UdpListener(
-        cfg.udp_listen_ip,
-        cfg.udp_tts_port,
-        "tts",
-        on_tts_packet,
-    )
-
+    udp_motion = UdpListener(cfg.udp_listen_ip, cfg.udp_motion_port, "motion", on_motion_packet)
+    udp_events = UdpListener(cfg.udp_listen_ip, cfg.udp_events_port, "events", on_events_packet)
+    udp_tts    = UdpListener(cfg.udp_listen_ip, cfg.udp_tts_port,    "tts",    on_tts_packet)
     udp_motion.start()
     udp_events.start()
     udp_tts.start()
 
-    # ── Local pygame gamepad ─────────────────────────────────────────────────
-
-    local: Optional[LocalGamepad] = None
-
+    local: Optional[LocalDongleListener] = None
     if cfg.local_dongle_enabled and not args.no_local_dongle:
-        local = LocalGamepad(
-            on_motion=on_motion_packet,
-            on_events=on_events_packet,
-            on_tts=on_tts_packet,
-            initial_robot_lock=True,
-            priority_value=cfg.local_dongle_priority,
-        )
+        local = LocalDongleListener(cfg.local_dongle_name_hints, on_motion_packet)
         local.start()
 
-    # ── Signal handling ──────────────────────────────────────────────────────
+    kb = start_keyboard_listener(toggle_recording)
+
+    # ── Signal handling and main wait ─────────────────────────────────────────
 
     running = threading.Event()
     running.set()
 
-    def on_signal(*_) -> None:
+    def on_signal(*_):
         running.clear()
 
-    signal.signal(signal.SIGINT, on_signal)
+    signal.signal(signal.SIGINT,  on_signal)
     signal.signal(signal.SIGTERM, on_signal)
 
-    log(
-        "teleop",
-        "ready — stream stays alive; stable unlock starts recording; stable lock stops recording",
-    )
+    log("teleop", "ready — 'r' to toggle recording, Ctrl-C to quit")
 
     try:
-        while running.is_set():
-            time.sleep(0.5)
-    except KeyboardInterrupt:
-        pass
+        try:
+            while running.is_set():
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            pass
+    finally:
+        # ── Shutdown ─────────────────────────────────────────────────────────────
+        log("teleop", "shutting down…")
+
+        try:
+            if recorder.is_active():
+                recorder.stop()
+        except Exception as exc:
+            log("teleop", f"recorder stop error: {exc}")
 
     # ── Shutdown ─────────────────────────────────────────────────────────────
 
     log("teleop", "shutting down…")
 
-    # Stop recording manager first so current session finalizes while cameras exist.
     try:
-        record_manager.stop()
+        if recorder.is_active():
+            recorder.stop()
     except Exception as exc:
-        log("teleop", f"record manager stop error: {exc}")
-
-    # Stop stream once, only on shutdown.
-    try:
-        stream.stop()
-    except Exception as exc:
-        log("teleop", f"stream stop error: {exc}")
+        log("teleop", f"recorder stop error: {exc}")
 
     for sub_name, sub in [
         ("udp_motion", udp_motion),
         ("udp_events", udp_events),
-        ("udp_tts", udp_tts),
-        ("local", local),
-        ("ptz", ptz),
-        ("lights", lights),
-        ("audio", audio),
-        ("motion", motion),
-        ("imu", imu),
-        ("gps", gps),
-        ("cameras", cameras),
+        ("udp_tts",    udp_tts),
+        ("local",      local),
+        ("kb",         kb),
+        ("stream",     stream),
+        ("ptz",        ptz),
+        ("lights",     lights),
+        ("audio",      audio),
+        ("motion",     motion),
+        ("imu",        imu),
+        ("gps",        gps),
+        ("cameras",    cameras),
     ]:
         if sub is None:
             continue
-
         try:
             if hasattr(sub, "stop"):
                 sub.stop()
