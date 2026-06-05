@@ -129,7 +129,7 @@ class LabConfig:
         # Rear AI camera is on USB (fallback to /dev/videoX if you don't have the exact by-id path)
         CameraConfig(
             name="ai_back",
-            source="/dev/v4l/by-id/usb-HD_Camera_Manufacturer_HD_USB_Camera_2020101401-video-index0", # You might need to change this to video0 or video1 depending on how Ubuntu enumerates them
+            source="/dev/video6", # You might need to change this to video0 or video1 depending on how Ubuntu enumerates them
             width=640, height=480, fps=15,
         ),
         # Floor camera is on USB
