@@ -9,12 +9,16 @@ from __future__ import annotations
 """
 REVO Scout LAB — unified controller and recorder.
 
-Debug behavior:
+Behavior:
 
     Local gamepad/dongle:
-        OFF by default.
-        Enable only with:
-            python teleop.py --enable-local-dongle
+        Always wired up. Whether it actually runs is controlled by
+        `cfg.local_dongle_enabled` in config.py.
+
+        The local gamepad thread is silent unless the user is physically
+        touching the controller (activity gate inside LocalGamepad), so a
+        plugged-in receiver with the controller powered off does NOT
+        interfere with the remote source.
 
     Stable unlock:
         start stream
@@ -24,10 +28,8 @@ Debug behavior:
         stop/finalize recording session
         stop stream
 
-    Missing robot_lock/lock:
+    Missing robot_lock/lock in a packet:
         keep previous lock state
-
-This is for debugging whether local gamepad is causing lock/source flicker.
 """
 
 import argparse
@@ -355,15 +357,6 @@ class SessionAndStreamManager(threading.Thread):
 def main() -> None:
     ap = argparse.ArgumentParser(description="REVO Scout LAB — unified controller")
     ap.add_argument("--env", default=None, help=".env file path, auto-detected if omitted")
-
-    # DEBUG DEFAULT:
-    # Local gamepad/dongle is OFF unless this flag is passed.
-    ap.add_argument(
-        "--enable-local-dongle",
-        action="store_true",
-        help="Enable local pygame gamepad/dongle. Default is disabled for debugging.",
-    )
-
     args = ap.parse_args()
 
     cfg = LabConfig.load_secrets(args.env)
@@ -377,7 +370,7 @@ def main() -> None:
         f"ports       = motion:{cfg.udp_motion_port} "
         f"events:{cfg.udp_events_port} tts:{cfg.udp_tts_port}",
     )
-    log("teleop", f"local_gamepad_debug_enabled = {args.enable_local_dongle}")
+    log("teleop", f"local_dongle_enabled = {cfg.local_dongle_enabled}")
     log("teleop", "=" * 60)
 
     rclpy_inited = False
@@ -621,23 +614,25 @@ def main() -> None:
     udp_events.start()
     udp_tts.start()
 
+    # Local gamepad — always wired up. The thread itself is silent until the
+    # user is physically touching the controller (activity gate inside
+    # LocalGamepad), so a plugged-in receiver with the controller off does
+    # not interfere with the remote source. Toggle the whole thing off only
+    # via `cfg.local_dongle_enabled` in config.py.
     local: Optional[LocalGamepad] = None
 
-    if args.enable_local_dongle:
-        if cfg.local_dongle_enabled:
-            local = LocalGamepad(
-                on_motion=on_motion_packet,
-                on_events=on_events_packet,
-                on_tts=on_tts_packet,
-                initial_robot_lock=True,
-                priority_value=cfg.local_dongle_priority,
-            )
-            local.start()
-            log("teleop", "local gamepad ENABLED by --enable-local-dongle")
-        else:
-            log("teleop", "local gamepad requested but cfg.local_dongle_enabled is false")
+    if cfg.local_dongle_enabled:
+        local = LocalGamepad(
+            on_motion=on_motion_packet,
+            on_events=on_events_packet,
+            on_tts=on_tts_packet,
+            initial_robot_lock=True,
+            priority_value=cfg.local_dongle_priority,
+        )
+        local.start()
+        log("teleop", "local gamepad enabled (activity-gated)")
     else:
-        log("teleop", "local gamepad DISABLED by default for debugging")
+        log("teleop", "local gamepad disabled by cfg.local_dongle_enabled=False")
 
     running = threading.Event()
     running.set()
@@ -650,7 +645,7 @@ def main() -> None:
 
     log(
         "teleop",
-        "ready — local OFF by default; stable unlock starts stream+recording; stable lock stops both",
+        "ready — stable unlock starts stream+recording; stable lock stops both",
     )
 
     try:
