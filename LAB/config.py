@@ -132,6 +132,11 @@ class LabConfig:
             source="/dev/video6", # You might need to change this to video0 or video1 depending on how Ubuntu enumerates them
             width=640, height=480, fps=15,
         ),
+        CameraConfig(
+            name="floor",
+            source="/dev/video2", # You might need to change this to video0 or video1 depending on how Ubuntu enumerates them
+            width=640, height=480, fps=15,
+        ),
         # Floor camera is on USB
         # CameraConfig(
         #     name="floor",
