@@ -169,7 +169,7 @@ class LocalGamepad(threading.Thread):
             dev = self._find_device(InputDevice, list_devices, ecodes)
 
             if dev is None:
-                log("local_gp", "no evdev gamepad found — waiting…")
+                # log("local_gp", "no evdev gamepad found — waiting…")
                 self._stop.wait(timeout=JOYSTICK_RETRY_SEC)
                 continue
 
