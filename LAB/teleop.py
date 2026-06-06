@@ -417,8 +417,10 @@ def main() -> None:
 
     cameras = MultiCameraCapture.from_configs(cfg.cameras)
 
-    imu = ImuReader(port=cfg.imu_port_hint, baud=cfg.imu_baud)
-    imu.start()
+    # imu = ImuReader(port=cfg.imu_port_hint, baud=cfg.imu_baud)
+    # imu.start()
+    imu = None
+
 
     gps = GpsReader(udp_host=cfg.gps_udp_host, udp_port=cfg.gps_udp_port)
     gps.start()
@@ -510,7 +512,7 @@ def main() -> None:
         video_bitrate=cfg.record_video_bitrate,
         encoder_preference=cfg.record_encoder_preference,
         motion_state_fn=motion.state,
-        imu_get_fn=imu.get,
+        # imu_get_fn=imu.get,
         gps_get_fn=gps.get,
     )
     recorder.set_robot_lock(True)
@@ -711,7 +713,7 @@ def main() -> None:
         ("lights", lights),
         ("audio", audio),
         ("motion", motion),
-        ("imu", imu),
+        # ("imu", imu),
         ("gps", gps),
         ("cameras", cameras),
     ]:

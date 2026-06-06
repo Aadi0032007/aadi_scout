@@ -50,7 +50,7 @@ class SessionRecorder:
         video_bitrate:      str,
         encoder_preference: list,
         motion_state_fn:    Optional[Callable[[], tuple]] = None,
-        imu_get_fn:         Optional[Callable[[], dict]]  = None,
+        # imu_get_fn:         Optional[Callable[[], dict]]  = None,
         gps_get_fn:         Optional[Callable[[], dict]]  = None,
     ) -> None:
         self._base_dir       = Path(base_dir)
@@ -62,7 +62,7 @@ class SessionRecorder:
         self._video_bitrate  = video_bitrate
         self._encoder_pref   = list(encoder_preference)
         self._motion_state   = motion_state_fn
-        self._imu_get        = imu_get_fn
+        # self._imu_get        = imu_get_fn
         self._gps_get        = gps_get_fn
 
         self._session_dir:   Optional[Path] = None
@@ -479,10 +479,10 @@ class SessionRecorder:
             except Exception:
                 pass
 
-        try:
-            imu_d = self._imu_get() if self._imu_get is not None else {}
-        except Exception:
-            imu_d = {}
+        # try:
+        #     imu_d = self._imu_get() if self._imu_get is not None else {}
+        # except Exception:
+        #     imu_d = {}
 
         try:
             gps_d = self._gps_get() if self._gps_get is not None else {}
@@ -491,35 +491,35 @@ class SessionRecorder:
 
         return {
             "frame_index":      idx,
-            "ts_unix":          round(now_unix, 4),
-            "ts_capture":       round(capture_ts, 4) if capture_ts else None,
+            # "ts_unix":          round(now_unix, 4),
+            # "ts_capture":       round(capture_ts, 4) if capture_ts else None,
             "relative_time":    rel_t,
 
             "linear_velocity":  lin_x,
             "angular_velocity": ang_z,
-            "robot_locked":     bool(locked),
-            "braking":          bool(braking),
+            # "robot_locked":     bool(locked),
+            # "braking":          bool(braking),
 
-            "accelerometer_x":  imu_d.get("accelerometer_x"),
-            "accelerometer_y":  imu_d.get("accelerometer_y"),
-            "accelerometer_z":  imu_d.get("accelerometer_z"),
-            "gyroscope_x":      imu_d.get("gyroscope_x"),
-            "gyroscope_y":      imu_d.get("gyroscope_y"),
-            "gyroscope_z":      imu_d.get("gyroscope_z"),
-            "magnetometer_x":   imu_d.get("magnetometer_x"),
-            "magnetometer_y":   imu_d.get("magnetometer_y"),
-            "magnetometer_z":   imu_d.get("magnetometer_z"),
-            "roll":             imu_d.get("roll"),
-            "pitch":            imu_d.get("pitch"),
-            "yaw":              imu_d.get("yaw"),
+            # "accelerometer_x":  imu_d.get("accelerometer_x"),
+            # "accelerometer_y":  imu_d.get("accelerometer_y"),
+            # "accelerometer_z":  imu_d.get("accelerometer_z"),
+            # "gyroscope_x":      imu_d.get("gyroscope_x"),
+            # "gyroscope_y":      imu_d.get("gyroscope_y"),
+            # "gyroscope_z":      imu_d.get("gyroscope_z"),
+            # "magnetometer_x":   imu_d.get("magnetometer_x"),
+            # "magnetometer_y":   imu_d.get("magnetometer_y"),
+            # "magnetometer_z":   imu_d.get("magnetometer_z"),
+            # "roll":             imu_d.get("roll"),
+            # "pitch":            imu_d.get("pitch"),
+            # "yaw":              imu_d.get("yaw"),
 
             "gps_latitude":        gps_d.get("gps_latitude"),
             "gps_longitude":       gps_d.get("gps_longitude"),
-            "gps_altitude":        gps_d.get("gps_altitude"),
-            "gps_fix":             gps_d.get("gps_fix"),
-            "gps_satellites":      gps_d.get("gps_satellites"),
-            "gps_hdop":            gps_d.get("gps_hdop"),
-            "gps_speed_kmh":       gps_d.get("gps_speed_kmh"),
+            # "gps_altitude":        gps_d.get("gps_altitude"),
+            # "gps_fix":             gps_d.get("gps_fix"),
+            # "gps_satellites":      gps_d.get("gps_satellites"),
+            # "gps_hdop":            gps_d.get("gps_hdop"),
+            # "gps_speed_kmh":       gps_d.get("gps_speed_kmh"),
             "orientation":         gps_d.get("orientation"),
             "gps_solution_status": gps_d.get("gps_solution_status"),
             "gps_position_type":   gps_d.get("gps_position_type"),
