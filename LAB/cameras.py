@@ -142,7 +142,7 @@ class CameraCapture:
             self._publish_enabled = False
             return
         try:
-            from .frame_bus import FrameBusPublisher
+            from LAB.utils.frame_bus import FrameBusPublisher
             h, w, c = frame.shape
             self._publisher = FrameBusPublisher(self.name, height=h, width=w, channels=c)
             log("cameras",
