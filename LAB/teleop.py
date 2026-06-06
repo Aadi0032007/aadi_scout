@@ -9,12 +9,12 @@ from __future__ import annotations
 """
 REVO Scout LAB — unified controller and recorder.
 
-Debug/fixed behavior:
+Production behavior:
 
-    Local gamepad/dongle:
-        OFF by default.
-        Enable only with:
-            python teleop.py --enable-local-dongle
+    Local gamepad:
+        always enabled
+        uses LAB.local_gamepad.LocalGamepad
+        should be evdev-based and event-driven
 
     Stable unlock:
         start stream
@@ -24,21 +24,18 @@ Debug/fixed behavior:
         stop/finalize recording session
         stop stream
 
-    Missing robot_lock/lock:
+    Missing robot_lock / lock:
         keep previous lock state
 
-    Critical local-gamepad fix:
-        Local packets are ignored BEFORE arbitration unless the local gamepad
-        explicitly sends robot_lock=False / lock=False.
+    Source priority:
+        local has higher priority
+        remote has lower priority
 
-        This prevents an idle/off 8BitDo dongle from becoming the active
-        source and interrupting stream/record.
-
-        After local explicitly unlocks, local packets are allowed.
-        When local explicitly locks again, local is de-authorized.
+No argparse.
+No --enable-local-dongle flag.
+No --no-local-dongle flag.
 """
 
-import argparse
 import json
 import signal
 import socket
@@ -122,6 +119,15 @@ class UdpListener(threading.Thread):
 # ── Source arbitration ────────────────────────────────────────────────────────
 
 class SourceArbiter:
+    """
+    Tracks active command source.
+
+    Lower priority number wins.
+    Example:
+        local  = 100
+        remote = 200
+    """
+
     def __init__(self, priorities: dict, timeout_sec: float) -> None:
         self._priorities = dict(priorities)
         self._timeout = timeout_sec
@@ -146,6 +152,7 @@ class SourceArbiter:
 
     def _update_active_locked(self) -> None:
         now = now_mono()
+
         live = [
             (self._priorities[s], s)
             for s, ts in self._last_seen.items()
@@ -167,11 +174,10 @@ def parse_lock_state(pkt: dict, last_known_locked: bool) -> tuple[bool, bool]:
     Return:
         locked, lock_field_present
 
-    Important:
-        Do NOT use:
-            truthy(pkt.get("robot_lock") or pkt.get("lock"))
+    Safe replacement for:
+        truthy(pkt.get("robot_lock") or pkt.get("lock"))
 
-        because it misreads False and missing values.
+    That old pattern breaks when robot_lock is False.
     """
     if "robot_lock" in pkt:
         return truthy(pkt["robot_lock"]), True
@@ -180,14 +186,6 @@ def parse_lock_state(pkt: dict, last_known_locked: bool) -> tuple[bool, bool]:
         return truthy(pkt["lock"]), True
 
     return last_known_locked, False
-
-
-def throttle_log(state: dict, key: str, period_sec: float, msg: str) -> None:
-    now = time.monotonic()
-    last = state.get(key, 0.0)
-    if now - last >= period_sec:
-        log("teleop", msg)
-        state[key] = now
 
 
 # ── Stream + recording manager ────────────────────────────────────────────────
@@ -341,6 +339,7 @@ class SessionAndStreamManager(threading.Thread):
         with self._cv:
             if self._stream_running and self._stream is not None:
                 stream_to_stop = self._stream
+
             self._stream = None
             self._stream_running = False
 
@@ -376,6 +375,7 @@ class SessionAndStreamManager(threading.Thread):
         with self._cv:
             if self._stream_running and self._stream is not None:
                 stream_to_stop = self._stream
+
             self._stream = None
             self._stream_running = False
 
@@ -389,19 +389,7 @@ class SessionAndStreamManager(threading.Thread):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="REVO Scout LAB — unified controller")
-    ap.add_argument("--env", default=None, help=".env file path, auto-detected if omitted")
-
-    # Debug default: local gamepad is OFF unless explicitly enabled.
-    ap.add_argument(
-        "--enable-local-dongle",
-        action="store_true",
-        help="Enable local pygame gamepad/dongle. Default is disabled for debugging.",
-    )
-
-    args = ap.parse_args()
-
-    cfg = LabConfig.load_secrets(args.env)
+    cfg = LabConfig.load_secrets(None)
 
     log("teleop", "=" * 60)
     log("teleop", f"cache_dir   = {cfg.cache_dir}")
@@ -412,8 +400,10 @@ def main() -> None:
         f"ports       = motion:{cfg.udp_motion_port} "
         f"events:{cfg.udp_events_port} tts:{cfg.udp_tts_port}",
     )
-    log("teleop", f"local_gamepad_debug_enabled = {args.enable_local_dongle}")
+    log("teleop", "local_gamepad = always enabled")
     log("teleop", "=" * 60)
+
+    # ── Init ROS2 once ───────────────────────────────────────────────────────
 
     rclpy_inited = False
     try:
@@ -422,6 +412,8 @@ def main() -> None:
         rclpy_inited = True
     except ImportError:
         log("teleop", "rclpy not available — motion will be disabled")
+
+    # ── Core subsystems ──────────────────────────────────────────────────────
 
     cameras = MultiCameraCapture.from_configs(cfg.cameras)
 
@@ -473,6 +465,8 @@ def main() -> None:
     ptz.start()
     ptz.set_ptz_unlock_state(True)
 
+    # ── Stream factory ───────────────────────────────────────────────────────
+
     def make_stream() -> DailyStream:
         return DailyStream(
             api_key=cfg.daily_api_key,
@@ -504,6 +498,8 @@ def main() -> None:
             motion_state_fn=motion.state,
         )
 
+    # ── Recorder ─────────────────────────────────────────────────────────────
+
     recorder = SessionRecorder(
         base_dir=cfg.cache_dir,
         camera_name=cfg.record_camera_name,
@@ -526,6 +522,8 @@ def main() -> None:
     )
     session_stream_manager.start()
 
+    # ── Source arbitration ───────────────────────────────────────────────────
+
     arbiter = SourceArbiter(
         priorities={
             "local": cfg.local_dongle_priority,
@@ -545,70 +543,10 @@ def main() -> None:
         "locked": True,
     }
 
-    # Local gate state.
-    # Local starts unauthorized. It must explicitly send unlock to take over.
-    local_gate = {
-        "authorized": False,
-        "last_drop_log": 0.0,
-        "last_event_drop_log": 0.0,
-    }
-
-    def local_packet_allowed(pkt: dict) -> tuple[bool, Optional[bool]]:
-        """
-        Return:
-            allowed, explicit_locked_or_none
-
-        Policy:
-            - Before local is authorized:
-                accept only explicit local unlock.
-                drop local locked/default/missing-lock packets.
-
-            - Once authorized:
-                allow local packets.
-                if it sends explicit lock=True, process that packet and then
-                de-authorize local after processing.
-        """
-        locked, lock_present = parse_lock_state(pkt, lock_state["locked"])
-
-        if not local_gate["authorized"]:
-            if not lock_present:
-                return False, None
-
-            # Do not allow a local locked packet to take over.
-            # Local must explicitly unlock first.
-            if locked:
-                return False, locked
-
-            # Explicit local unlock arms local control.
-            local_gate["authorized"] = True
-            log("teleop", "LOCAL GATE: authorized by explicit local unlock")
-            return True, locked
-
-        return True, locked if lock_present else None
+    # ── Dispatchers ──────────────────────────────────────────────────────────
 
     def on_motion_packet(pkt: dict, addr, port: int) -> None:
         source = "local" if pkt.get("_local") else "remote"
-
-        # ── Critical fix ─────────────────────────────────────────────────────
-        #
-        # Do NOT report local to the arbiter until it is authorized.
-        # This prevents idle/off dongle packets from making "local" active.
-        if source == "local":
-            allowed, explicit_local_lock = local_packet_allowed(pkt)
-
-            if not allowed:
-                throttle_log(
-                    local_gate,
-                    "last_drop_log",
-                    2.0,
-                    "LOCAL GATE: dropped local packet before arbitration "
-                    f"robot_lock={pkt.get('robot_lock', '<missing>')} "
-                    f"lock={pkt.get('lock', '<missing>')} "
-                    f"button={pkt.get('button', '<missing>')} "
-                    f"lin_x={pkt.get('lin_x', '<missing>')} "
-                    f"ang_z={pkt.get('ang_z', '<missing>')}",
-                )
-                return
 
         arbiter.report(source)
 
@@ -634,6 +572,7 @@ def main() -> None:
         brake = first_float(pkt, ("brake",), default=0.0) > cfg.brake_threshold
 
         motion.command(lin, ang, locked, brake)
+
         lights.set_robot_lock(locked)
         session_stream_manager.set_stream_robot_lock(locked)
 
@@ -671,25 +610,7 @@ def main() -> None:
         prev_state["b_pressed"] = b_pressed
         prev_state["button_8"] = button_8
 
-        # If local explicitly locked, let that lock packet through,
-        # then immediately de-authorize local so idle local cannot keep
-        # overriding remote afterward.
-        if source == "local" and lock_present and locked:
-            local_gate["authorized"] = False
-            log("teleop", "LOCAL GATE: de-authorized after explicit local lock")
-
     def on_events_packet(pkt: dict, addr, port: int) -> None:
-        # Optional safety: ignore local events until local is authorized.
-        # This prevents idle/noisy local module from firing lights/audio events.
-        if pkt.get("_local") and not local_gate["authorized"]:
-            throttle_log(
-                local_gate,
-                "last_event_drop_log",
-                2.0,
-                "LOCAL GATE: dropped local event before authorization",
-            )
-            return
-
         event = (pkt.get("event") or "").strip().lower()
 
         if event in ("lights", "signals", "talk"):
@@ -708,14 +629,12 @@ def main() -> None:
                     audio.play_music(int(track))
 
     def on_tts_packet(pkt: dict, addr, port: int) -> None:
-        # Optional safety: ignore local TTS until local is authorized.
-        if pkt.get("_local") and not local_gate["authorized"]:
-            return
-
         if pkt.get("type") == "stt":
             text = pkt.get("text", "")
             if text:
                 audio.speak(str(text))
+
+    # ── UDP listeners ────────────────────────────────────────────────────────
 
     udp_motion = UdpListener(
         cfg.udp_listen_ip,
@@ -740,24 +659,19 @@ def main() -> None:
     udp_events.start()
     udp_tts.start()
 
-    local: Optional[LocalGamepad] = None
+    # ── Local gamepad always on ──────────────────────────────────────────────
 
-    if args.enable_local_dongle:
-        if cfg.local_dongle_enabled:
-            local = LocalGamepad(
-                on_motion=on_motion_packet,
-                on_events=on_events_packet,
-                on_tts=on_tts_packet,
-                initial_robot_lock=True,
-                priority_value=cfg.local_dongle_priority,
-            )
-            local.start()
-            log("teleop", "local gamepad ENABLED by --enable-local-dongle")
-            log("teleop", "LOCAL GATE: waiting for explicit local unlock before allowing local arbitration")
-        else:
-            log("teleop", "local gamepad requested but cfg.local_dongle_enabled is false")
-    else:
-        log("teleop", "local gamepad DISABLED by default for debugging")
+    local = LocalGamepad(
+        on_motion=on_motion_packet,
+        on_events=on_events_packet,
+        on_tts=on_tts_packet,
+        initial_robot_lock=True,
+        priority_value=cfg.local_dongle_priority,
+    )
+    local.start()
+    log("teleop", "local gamepad started")
+
+    # ── Signal handling ──────────────────────────────────────────────────────
 
     running = threading.Event()
     running.set()
@@ -770,7 +684,7 @@ def main() -> None:
 
     log(
         "teleop",
-        "ready — local gated; stable unlock starts stream+recording; stable lock stops both",
+        "ready — local always on; stable unlock starts stream+recording; stable lock stops both",
     )
 
     try:
@@ -778,6 +692,8 @@ def main() -> None:
             time.sleep(0.5)
     except KeyboardInterrupt:
         pass
+
+    # ── Shutdown ─────────────────────────────────────────────────────────────
 
     log("teleop", "shutting down…")
 
