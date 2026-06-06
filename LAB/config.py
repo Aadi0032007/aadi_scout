@@ -40,6 +40,12 @@ class CameraConfig:
     fps:    int = 15
     rtsp_transport: str = "tcp"   # only used for RTSP sources
 
+    # Frame-bus fan-out. If True, the capture thread also writes each frame
+    # into a /dev/shm region named "lab_<name>" so external processes (e.g.
+    # an AI inference worker) can read frames without touching V4L2.
+    # See LAB/frame_bus.py for the reader API.
+    publish_frames: bool = False
+
     @property
     def is_rtsp(self) -> bool:
         return self.source.startswith("rtsp://")
@@ -113,6 +119,10 @@ class LabConfig:
     ])
 
     # ── Cameras ───────────────────────────────────────────────────────────────
+    #
+    # Set publish_frames=True on any camera whose frames you want to expose
+    # to external processes (AI inference, debug viewers, etc.) via shared
+    # memory. The region appears as /dev/shm/lab_<name>. See LAB/frame_bus.py.
     cameras: list = field(default_factory=lambda: [
         # Orbital is on the network
         CameraConfig(
@@ -120,11 +130,12 @@ class LabConfig:
     	    source="rtsp://revolabs:revolabs123%40@192.168.10.50:554/h264Preview_01_sub",
 	    width=640, height=480, fps=15, rtsp_transport="tcp",
         ),
-        # Front AI camera is on USB
+        # Front AI camera is on USB — exposed on the frame bus for inference
         CameraConfig(
             name="ai_front",
-            source="/dev/video8", 
+            source="/dev/video8",
             width=640, height=480, fps=15,
+            publish_frames=True,
         ),
         # Rear AI camera is on USB (fallback to /dev/videoX if you don't have the exact by-id path)
         CameraConfig(

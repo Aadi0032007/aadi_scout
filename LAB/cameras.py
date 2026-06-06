@@ -21,6 +21,15 @@ this capture will fail at startup and that camera is simply absent from
 the collection. The orchestrator carries on with whichever cameras opened.
 
 Auto-reconnect with exponential backoff on stream drop.
+
+Frame bus fan-out
+-----------------
+If a CameraConfig has publish_frames=True, the capture thread also writes
+each frame into a shared-memory region (see LAB/frame_bus.py). External
+processes — e.g. an AI inference worker — attach to that region as readers
+and never touch the V4L2 device themselves. The publisher is created
+lazily on the first decoded frame so we use the camera's actual reported
+shape, not the requested one (some V4L2 devices ignore CAP_PROP_FRAME_*).
 """
 
 import os
@@ -47,6 +56,10 @@ class CameraCapture:
         self._stop   = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
+        # Frame-bus publisher (created lazily on first frame, only if enabled)
+        self._publish_enabled = bool(getattr(cfg, "publish_frames", False))
+        self._publisher = None   # FrameBusPublisher | None
+
     # ── public API ────────────────────────────────────────────────────────────
 
     def start(self) -> bool:
@@ -64,7 +77,8 @@ class CameraCapture:
             "cameras",
             f"{self.name}: started "
             f"{self._cfg.width}x{self._cfg.height}@{self._cfg.fps}fps "
-            f"({'RTSP' if self._cfg.is_rtsp else 'V4L2'})",
+            f"({'RTSP' if self._cfg.is_rtsp else 'V4L2'})"
+            f"{' [bus]' if self._publish_enabled else ''}",
         )
         return True
 
@@ -82,6 +96,12 @@ class CameraCapture:
             self._thread = None
         with self._lock:
             self._frame = None
+        if self._publisher is not None:
+            try:
+                self._publisher.close()
+            except Exception as exc:
+                log("cameras", f"{self.name}: publisher close error: {exc}")
+            self._publisher = None
 
     # ── capture pipeline ──────────────────────────────────────────────────────
 
@@ -113,6 +133,24 @@ class CameraCapture:
                 pass
         return cap
 
+    def _ensure_publisher(self, frame: np.ndarray) -> None:
+        """Lazily create the frame-bus publisher using the actual decoded frame shape."""
+        if not self._publish_enabled or self._publisher is not None:
+            return
+        if frame.ndim != 3:
+            log("cameras", f"{self.name}: bus disabled — unexpected frame.ndim={frame.ndim}")
+            self._publish_enabled = False
+            return
+        try:
+            from .frame_bus import FrameBusPublisher
+            h, w, c = frame.shape
+            self._publisher = FrameBusPublisher(self.name, height=h, width=w, channels=c)
+            log("cameras",
+                f"{self.name}: frame bus → /dev/shm/{self._publisher.name} ({w}x{h}x{c})")
+        except Exception as exc:
+            log("cameras", f"{self.name}: frame bus init failed: {exc}")
+            self._publish_enabled = False
+
     def _run(self) -> None:
         backoff = 1.0
         while not self._stop.is_set():
@@ -128,9 +166,26 @@ class CameraCapture:
                 ok, frame = cap.read()
                 if not ok or frame is None:
                     break   # stream ended → reconnect
+                now = time.time()
                 with self._lock:
                     self._frame = frame
-                    self._ts = time.time()
+                    self._ts = now
+
+                # Fan-out to shared memory if enabled. This is one extra memcpy
+                # per frame (~100 µs at 640x480x3) — negligible vs the 66 ms
+                # frame budget at 15 fps. Any error here is non-fatal: it
+                # disables the publisher but never blocks normal capture.
+                if self._publish_enabled:
+                    self._ensure_publisher(frame)
+                    if self._publisher is not None:
+                        try:
+                            self._publisher.publish(frame, now)
+                        except Exception as exc:
+                            log("cameras", f"{self.name}: publish error: {exc}")
+                            try: self._publisher.close()
+                            except Exception: pass
+                            self._publisher = None
+                            self._publish_enabled = False
 
             cap.release()
             log("cameras", f"{self.name}: stream lost, reconnecting in {backoff:.1f}s")
