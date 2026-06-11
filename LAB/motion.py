@@ -16,6 +16,9 @@ shares the global context with this controller.
 
 Behavior:
     - Publishes geometry_msgs/Twist to /cmd_vel at motion_publish_hz.
+    - Subscribes to /cmd_vel to echo back what was actually published,
+      regardless of source (teleop or inference policy). This is the
+      value exposed to the recorder via published_state().
     - Watchdog: if no command arrives within motion_watchdog_sec, output zero.
     - robot_lock=True → output zero regardless of incoming commands.
     - brake=True       → output zero regardless of incoming commands.
@@ -25,6 +28,18 @@ Behavior:
 
 The orchestrator passes parsed values into command() — this controller
 does no UDP work and doesn't know about source arbitration.
+
+Recording note
+--------------
+Do NOT pass motion.state to the recorder. It returns raw pre-scaling,
+pre-gate values from the last UDP packet, which:
+    - has ang_z inflated 5× (ang_z_scale not applied)
+    - ignores watchdog / lock / brake zeros
+    - returns stale data when there is no teleoperator (inference mode)
+
+Pass motion.published_state instead. It reads whatever was last seen on
+/cmd_vel, so it is always correct whether the source is a human operator
+or an inference policy.
 """
 
 import threading
@@ -55,9 +70,16 @@ class MotionController:
         self._braking       = False
         self._last_cmd_t    = 0.0
 
+        # Last values confirmed on /cmd_vel — set by the subscriber echo.
+        # This reflects what the robot actually received, whether the source
+        # is this controller's publish loop or an inference policy.
+        self._last_pub_lin: float = 0.0
+        self._last_pub_ang: float = 0.0
+
         # ROS2 handles
         self._node          = None
         self._pub           = None
+        self._sub           = None
         self._executor      = None
         self._executor_thread: Optional[threading.Thread] = None
 
@@ -83,6 +105,17 @@ class MotionController:
 
             self._node = rclpy.create_node("lab_motion")
             self._pub  = self._node.create_publisher(Twist, self._topic, 10)
+
+            # Subscribe to /cmd_vel so published_state() reflects the actual
+            # topic value regardless of whether we published it or an inference
+            # policy did. The callback runs on the executor thread; the lock
+            # makes the two-field update atomic from the reader's perspective.
+            self._sub = self._node.create_subscription(
+                Twist,
+                self._topic,
+                self._on_cmd_vel_echo,
+                10,
+            )
 
             self._executor = SingleThreadedExecutor()
             self._executor.add_node(self._node)
@@ -123,6 +156,7 @@ class MotionController:
                 pass
         self._node = None
         self._pub  = None
+        self._sub  = None
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -136,9 +170,42 @@ class MotionController:
             self._last_cmd_t = time.monotonic()
 
     def state(self) -> tuple[float, float, bool, bool]:
-        """Public read of (lin_x, ang_z, locked, braking). Used by stream badges and recorder."""
+        """Raw pre-gate state: (lin_x, ang_z, locked, braking).
+
+        This is what the teleoperator commanded before ang_z_scale,
+        watchdog, lock, and brake are applied. Used for the stream's
+        speed-badge overlay where showing operator intent is appropriate.
+
+        Do NOT pass this to the recorder. Use published_state() there.
+        """
         with self._lock:
             return self._lin_x, self._ang_z, self._locked, self._braking
+
+    def published_state(self) -> tuple[float, float]:
+        """Return the last (linear_x, angular_z) confirmed on /cmd_vel.
+
+        This is what the robot actually received: post ang_z_scale,
+        post watchdog, post lock/brake. It is updated by the /cmd_vel
+        subscriber so it works correctly whether the publisher is this
+        controller's loop (teleoperation) or an external inference policy.
+
+        Always pass THIS to the recorder, not state().
+        """
+        with self._lock:
+            return self._last_pub_lin, self._last_pub_ang
+
+    # ── /cmd_vel subscriber echo ─────────────────────────────────────────────
+
+    def _on_cmd_vel_echo(self, msg) -> None:
+        """Subscriber callback: capture whatever lands on /cmd_vel.
+
+        Runs on the executor (motion-spin) thread. The lock makes the
+        two-field write atomic from published_state()'s perspective.
+        The critical section is ~50 ns — no contention risk.
+        """
+        with self._lock:
+            self._last_pub_lin = msg.linear.x
+            self._last_pub_ang = msg.angular.z
 
     # ── publisher loop ────────────────────────────────────────────────────────
 
