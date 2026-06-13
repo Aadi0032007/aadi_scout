@@ -435,9 +435,10 @@ class LabInference:
 
         print()
         print(f"{'frame':>6}  {'timestamp':>12}  {'frame_mean':>10}  "
+              f"{'obs_lin':>8}  {'obs_ang':>10}  "
               f"{'lin_x':>8}  {'ang_z_pred':>12}  {'ang_z_cmd':>12}  "
               f"{'→robot':>8}")
-        print("─" * 85)
+        print("─" * 105)
 
         try:
             while not self._stop.is_set():
@@ -537,6 +538,8 @@ class LabInference:
                     f"{frame_i:>6d}  "
                     f"{wall_ts:>12.3f}  "
                     f"{mean_px:>10.1f}  "
+                    f"{lin_x_obs:>+8.4f}  "
+                    f"{ang_z_obs:>+10.5f}  "
                     f"{pred_lin:>+8.4f}  "
                     f"{pred_ang:>+12.5f}{db_marker}  "
                     f"{ang_z_cmd:>+12.5f}  "
@@ -563,7 +566,7 @@ class LabInference:
             import traceback
             traceback.print_exc()
         finally:
-            print("─" * 85)
+            print("─" * 105)
             log("inference", f"frame stats: {self._validator.summary()}")
             self._safe_stop()
 
@@ -723,12 +726,12 @@ def main() -> int:
     print(f"  GPS UDP         : {cfg.gps_udp_host}:{cfg.gps_udp_port}")
     print()
     print("  Column guide:")
-    print("  frame  timestamp      frame_mean    lin_x    ang_z_pred(DB)  ang_z_cmd  →robot")
+    print("  frame  timestamp  frame_mean  obs_lin  obs_ang  lin_x  ang_z_pred(DB)  ang_z_cmd  →robot")
     print("  ─────────────────────────────────────────────────────────────────────────────")
-    print("  ang_z_pred = policy output (scaled, ×0.20 convention)")
+    print("  ang_z_pred = policy output (RAW — old dataset)")
     print("  DB         = deadbanded to zero")
-    print("  ang_z_cmd  = ang_z_pred (RAW, old dataset — passed directly to motion.command())")
-    print("             motion.command() × 0.20 → /cmd_vel receives ang_z_pred ✓")
+    print("  ang_z_cmd  = ang_z_pred (passed directly to motion.command())")
+    print("             motion.command() × 0.20 → /cmd_vel receives ang_z_pred × 0.20 ✓")
     print("═" * 60)
     print()
 
