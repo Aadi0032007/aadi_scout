@@ -125,6 +125,7 @@ class UdpMotionSender:
             "lin_x":      float(lin_x),
             "ang_z":      float(ang_z),
             "robot_lock": bool(robot_lock),
+            "origin":     "ai", 
         }).encode("utf-8")
         try:
             return self._sock.sendto(payload, self._addr)
