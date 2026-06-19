@@ -215,8 +215,8 @@ class MotionController:
                                   bool(locked), bool(braking), now)
 
             meaningful = (
-                abs(lin_x) > self._human_idle_db
-                or abs(ang_z) > self._human_idle_db
+                abs(lin_x) >= self._human_idle_db
+                or abs(ang_z) >= self._human_idle_db
                 or bool(braking)
             )
             if meaningful:

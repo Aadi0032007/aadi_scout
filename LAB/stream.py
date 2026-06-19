@@ -18,7 +18,8 @@ Each outgoing frame is composed:
     1. Pull latest frame from the current "main" camera source
     2. Pull latest frames from the two thumbnail sources (pilot + rear)
     3. Composite thumbnails as picture-in-picture overlays
-    4. Draw badges: speed, camera-name, optional timestamp, HUMAN/AI source
+    4. Draw badges: speed (with "AI " prefix when AI is driving),
+       camera-name, optional timestamp
     5. Convert BGR → RGB
     6. Push to Daily
 
@@ -304,15 +305,18 @@ class DailyStream:
         if self._show_speed_badge and self._motion_state is not None:
             try:
                 lin, _, locked, braking = self._motion_state()
-                self._overlay_speed_badge(frame, lin, locked, braking)
+                # AI-vs-human gets folded into the speed badge text itself.
+                # When motion_human_in_control_fn isn't wired up (None), we
+                # default to human (no prefix, same as the original behavior).
+                is_ai = False
+                if self._motion_human_in_control is not None:
+                    try:
+                        is_ai = not bool(self._motion_human_in_control())
+                    except Exception:
+                        pass
+                self._overlay_speed_badge(frame, lin, locked, braking, is_ai=is_ai)
             except Exception:
                 pass
-
-        # HUMAN/AI source badge (bottom-right). Reflects the same selection
-        # the arbiter uses for /cmd_vel, so the badge can never disagree
-        # with what the robot is actually doing.
-        if self._motion_human_in_control is not None:
-            self._overlay_source_badge(frame)
 
         if self._show_timestamp:
             self._overlay_timestamp(frame)
@@ -361,59 +365,43 @@ class DailyStream:
             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA,
         )
 
-    def _overlay_speed_badge(self, frame: np.ndarray, lin: float, locked: bool, braking: bool) -> None:
+    def _overlay_speed_badge(
+        self,
+        frame: np.ndarray,
+        lin: float,
+        locked: bool,
+        braking: bool,
+        is_ai: bool = False,
+    ) -> None:
+        """Bottom-left badge.
+
+        Human driving : "speed=+25%"      (white)
+        AI driving    : "AI speed=+25%"   (orange — stands out)
+        Locked        : "LOCKED"          (red, no AI prefix)
+        Braking       : "BRAKE"           (red, no AI prefix)
+        """
         H = frame.shape[0]
         if locked:
-            text = "LOCKED"
+            text  = "LOCKED"
             color = (0, 0, 255)         # red in BGR
         elif braking:
-            text = "BRAKE"
+            text  = "BRAKE"
             color = (0, 0, 255)
         else:
-            pct = int(round(lin * 100.0))
+            pct  = int(round(lin * 100.0))
             text = f"speed={pct:+d}%"
             color = (255, 255, 255)
+
+        # When AI is driving, prefix with "AI". Nothing for human.
+        # Only prepend for the normal speed-readout case so LOCKED/BRAKE
+        # stay clean — those reflect safety state, not source.
+        if is_ai and not (locked or braking):
+            text  = "AI " + text
+            color = (0, 140, 255)       # orange in BGR — pops vs white
+
         cv2.putText(
             frame, text, (10, H - 14),
             cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2, cv2.LINE_AA,
-        )
-
-    def _overlay_source_badge(self, frame: np.ndarray) -> None:
-        """Bottom-right pill showing who's currently driving: HUMAN or AI.
-
-        Green pill  = human in control (handback open or AI gated off).
-        Orange pill = AI driving.
-        Sits below the right-side PiP thumbnail so it never collides.
-        """
-        try:
-            human = bool(self._motion_human_in_control())
-        except Exception:
-            return
-
-        if human:
-            text, bg, fg = "HUMAN", (40, 180, 40),   (255, 255, 255)   # green / white
-        else:
-            text, bg, fg = "AI",    (0, 140, 255),   (0, 0, 0)         # orange / black (BGR)
-
-        H, W = frame.shape[:2]
-        font, scale, thick = cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2
-        (tw, th), baseline = cv2.getTextSize(text, font, scale, thick)
-        pad_x, pad_y = 10, 6
-
-        x2 = W - 10
-        y2 = H - 10
-        x1 = x2 - tw - 2 * pad_x
-        y1 = y2 - th - 2 * pad_y - baseline
-
-        # Bounds check — degrade silently if frame is unexpectedly tiny
-        if x1 < 0 or y1 < 0:
-            return
-
-        cv2.rectangle(frame, (x1, y1), (x2, y2), bg, -1)              # filled pill
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 255, 255), 1)  # white border
-        cv2.putText(
-            frame, text, (x1 + pad_x, y2 - pad_y),
-            font, scale, fg, thick, cv2.LINE_AA,
         )
 
     def _overlay_timestamp(self, frame: np.ndarray) -> None:
