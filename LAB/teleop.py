@@ -31,6 +31,18 @@ Production behavior:
         local has higher priority
         remote has lower priority
 
+    Human / AI arbitration (NEW):
+        Local + remote gamepad packets are tagged origin="human".
+        lab_inference_udp.py tags its packets origin="ai".
+        Local-vs-remote arbitration is unchanged (SourceArbiter, local wins).
+        Human-vs-AI arbitration lives inside MotionController:
+            • Human commands always win during a 2s handback window.
+            • AI commands only honored when set_ai_enabled(True) AND
+              handback window is closed.
+            • Human brake = hard latch: AI disabled until explicit re-enable.
+        Human re-enables AI by chording both lift triggers on the gamepad,
+        which sets "ai_request":"enable" on the UDP packet for a few ticks.
+
 No argparse.
 No --enable-local-dongle flag.
 No --no-local-dongle flag.
@@ -126,6 +138,10 @@ class SourceArbiter:
     Example:
         local  = 100
         remote = 200
+
+    Note: this only arbitrates between HUMAN sources (local vs remote gamepad).
+    AI packets (origin="ai") bypass this entirely — the human/AI gate is
+    handled inside MotionController.
     """
 
     def __init__(self, priorities: dict, timeout_sec: float) -> None:
@@ -548,12 +564,32 @@ def main() -> None:
     # ── Dispatchers ──────────────────────────────────────────────────────────
 
     def on_motion_packet(pkt: dict, addr, port: int) -> None:
+        origin = (pkt.get("origin") or "human").lower()
+
+        # ── AI path: bypass SourceArbiter and all human-side logic ──────
+        # MotionController's internal arbiter decides whether this
+        # command actually drives /cmd_vel based on:
+        #   • whether set_ai_enabled(True) has been called by the human,
+        #   • and whether the human-handback window is closed.
+        if origin == "ai":
+            lin = first_float(pkt, ("lin_x", "linx", "linear_x"))
+            ang = first_float(pkt, ("ang_z", "angz", "angular_z"))
+            motion.command(lin, ang, locked=False, braking=False, origin="ai")
+            return
+
+        # ── Human path (existing behavior; local-priority preserved) ────
         source = "local" if pkt.get("_local") else "remote"
 
         arbiter.report(source)
 
         if not arbiter.is_active(source):
             return
+
+        # Edge: human grants AI control via explicit chord on the gamepad
+        # (sender sets "ai_request":"enable" for a few packets on the edge).
+        if pkt.get("ai_request") == "enable":
+            motion.set_ai_enabled(True)
+            log("teleop", f"AI control ENABLED by human ({source}, addr={addr})")
 
         locked, lock_present = parse_lock_state(pkt, lock_state["locked"])
 
@@ -573,7 +609,7 @@ def main() -> None:
         ang = first_float(pkt, ("ang_z", "angz", "angular_z"))
         brake = first_float(pkt, ("brake",), default=0.0) > cfg.brake_threshold
 
-        motion.command(lin, ang, locked, brake)
+        motion.command(lin, ang, locked, brake, origin="human")
 
         lights.set_robot_lock(locked)
         session_stream_manager.set_stream_robot_lock(locked)
