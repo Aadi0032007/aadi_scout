@@ -69,6 +69,7 @@ class MotionController:
         # ── NEW: human-priority arbiter knobs ────────────────────────────
         human_handback_sec:  float = 2.0,
         human_idle_deadband: float = 0.05,
+        human_stale_timeout: float = 2.0,   # disable AI if no human packet for this long
     ) -> None:
         self._topic         = topic
         self._publish_hz    = max(1, publish_hz)
@@ -99,6 +100,7 @@ class MotionController:
         self._human_active_until = 0.0
         self._human_handback_sec = float(human_handback_sec)
         self._human_idle_db      = float(human_idle_deadband)
+        self._human_stale_timeout = float(human_stale_timeout)
 
         # Last values actually published to /cmd_vel — for recorder.
         # Updated synchronously inside _publish_loop, same as before.
@@ -148,7 +150,8 @@ class MotionController:
                 "motion",
                 f"publishing → {self._topic} @ {self._publish_hz} Hz "
                 f"(watchdog={self._watchdog*1000:.0f}ms, ang_scale={self._ang_z_scale}, "
-                f"handback={self._human_handback_sec}s, idle_db={self._human_idle_db})"
+                f"handback={self._human_handback_sec}s, idle_db={self._human_idle_db}, "
+                f"human_stale={self._human_stale_timeout}s)"
             )
         except ImportError:
             log("motion", "rclpy not installed — motion disabled")
@@ -304,6 +307,18 @@ class MotionController:
             now = time.monotonic()
             h_lin, h_ang, h_locked, h_brake, h_t = self._latest_human
             a_lin, a_ang, _a_lk, _a_br,  a_t    = self._latest_ai
+
+            # ── Safety latch: no human packet for too long while AI is enabled ──
+            # Handles gamepad disconnect / network drop. Forces human to
+            # explicitly re-chord to re-enable AI. h_t > 0 guards against
+            # tripping at startup before any human packet has arrived.
+            if (self._ai_enabled and h_t > 0.0
+                    and (now - h_t) > self._human_stale_timeout):
+                log("motion",
+                    f"AI auto-disabled: no human packet for {now - h_t:.1f}s "
+                    f"(gamepad disconnect?)")
+                self._ai_enabled = False
+                self._latest_ai  = (0.0, 0.0, False, False, 0.0)
 
             ai_enabled      = self._ai_enabled
             handback_active = now < self._human_active_until
