@@ -249,19 +249,33 @@ class MotionController:
         the robot (human or AI). Lock and brake are always reported from
         the human side, since AI cannot unlock or un-brake.
 
+        Respects the watchdog: if the selected source's last packet is
+        older than watchdog_sec, returns 0 for lin/ang. This keeps the
+        overlay in sync with what _compute_output actually publishes
+        (e.g. after a gamepad disconnect the badge shows 0, not the
+        stale last value).
+
         Do NOT pass this to the recorder. Use published_state().
         """
         with self._lock:
             now = time.monotonic()
-            h_lin, h_ang, h_locked, h_brake, _h_t = self._latest_human
-            a_lin, a_ang, _a_lk, _a_br, _a_t      = self._latest_ai
+            h_lin, h_ang, h_locked, h_brake, h_t = self._latest_human
+            a_lin, a_ang, _a_lk, _a_br, a_t      = self._latest_ai
 
             handback_active  = now < self._human_active_until
             human_in_control = handback_active or (not self._ai_enabled)
 
             if human_in_control:
-                return h_lin, h_ang, h_locked, h_brake
-            return a_lin, a_ang, h_locked, h_brake
+                src_lin, src_ang, src_t = h_lin, h_ang, h_t
+            else:
+                src_lin, src_ang, src_t = a_lin, a_ang, a_t
+
+            # Watchdog: if selected source is stale, the publish loop is
+            # sending zeros — overlay must show zeros too.
+            if (now - src_t) >= self._watchdog:
+                src_lin, src_ang = 0.0, 0.0
+
+            return src_lin, src_ang, h_locked, h_brake
 
     def published_state(self) -> tuple[float, float]:
         """Last (lin_x, ang_z) actually sent to /cmd_vel — for the recorder.

@@ -18,7 +18,7 @@ Each outgoing frame is composed:
     1. Pull latest frame from the current "main" camera source
     2. Pull latest frames from the two thumbnail sources (pilot + rear)
     3. Composite thumbnails as picture-in-picture overlays
-    4. Draw badges: speed, camera-name, optional timestamp
+    4. Draw badges: speed, camera-name, optional timestamp, HUMAN/AI source
     5. Convert BGR → RGB
     6. Push to Daily
 
@@ -76,6 +76,7 @@ class DailyStream:
         mic_channels:      int,
         mic_frame_ms:      int,
         motion_state_fn:   Optional[Callable[[], tuple]] = None,
+        motion_human_in_control_fn: Optional[Callable[[], bool]] = None,
     ) -> None:
         self._api_key      = api_key
         self._room_url     = room_url
@@ -86,6 +87,7 @@ class DailyStream:
         self._cameras      = cameras
         self._aliases      = {k.strip().lower(): v for k, v in (name_aliases or {}).items()}
         self._motion_state = motion_state_fn      # () → (lin_x, ang_z, locked, braking)
+        self._motion_human_in_control = motion_human_in_control_fn   # () → bool
 
         # PiP / overlay config
         self._pip_enabled       = pip_enabled
@@ -306,6 +308,12 @@ class DailyStream:
             except Exception:
                 pass
 
+        # HUMAN/AI source badge (bottom-right). Reflects the same selection
+        # the arbiter uses for /cmd_vel, so the badge can never disagree
+        # with what the robot is actually doing.
+        if self._motion_human_in_control is not None:
+            self._overlay_source_badge(frame)
+
         if self._show_timestamp:
             self._overlay_timestamp(frame)
 
@@ -368,6 +376,44 @@ class DailyStream:
         cv2.putText(
             frame, text, (10, H - 14),
             cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2, cv2.LINE_AA,
+        )
+
+    def _overlay_source_badge(self, frame: np.ndarray) -> None:
+        """Bottom-right pill showing who's currently driving: HUMAN or AI.
+
+        Green pill  = human in control (handback open or AI gated off).
+        Orange pill = AI driving.
+        Sits below the right-side PiP thumbnail so it never collides.
+        """
+        try:
+            human = bool(self._motion_human_in_control())
+        except Exception:
+            return
+
+        if human:
+            text, bg, fg = "HUMAN", (40, 180, 40),   (255, 255, 255)   # green / white
+        else:
+            text, bg, fg = "AI",    (0, 140, 255),   (0, 0, 0)         # orange / black (BGR)
+
+        H, W = frame.shape[:2]
+        font, scale, thick = cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2
+        (tw, th), baseline = cv2.getTextSize(text, font, scale, thick)
+        pad_x, pad_y = 10, 6
+
+        x2 = W - 10
+        y2 = H - 10
+        x1 = x2 - tw - 2 * pad_x
+        y1 = y2 - th - 2 * pad_y - baseline
+
+        # Bounds check — degrade silently if frame is unexpectedly tiny
+        if x1 < 0 or y1 < 0:
+            return
+
+        cv2.rectangle(frame, (x1, y1), (x2, y2), bg, -1)              # filled pill
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 255, 255), 1)  # white border
+        cv2.putText(
+            frame, text, (x1 + pad_x, y2 - pad_y),
+            font, scale, fg, thick, cv2.LINE_AA,
         )
 
     def _overlay_timestamp(self, frame: np.ndarray) -> None:
