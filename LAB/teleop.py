@@ -514,6 +514,7 @@ def main() -> None:
             mic_channels=cfg.mic_channels,
             mic_frame_ms=cfg.mic_frame_ms,
             motion_state_fn=motion.state,
+            motion_human_in_control_fn=motion.human_in_control
         )
 
     # ── Recorder ─────────────────────────────────────────────────────────────
