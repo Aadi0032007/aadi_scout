@@ -239,17 +239,26 @@ class MotionController:
                 log("motion", f"ai_enabled -> {self._ai_enabled}")
 
     def state(self) -> tuple[float, float, bool, bool]:
-        """Human operator's pre-gate intent: (lin_x, ang_z, locked, braking).
+        """Active source's pre-gate intent: (lin_x, ang_z, locked, braking).
 
-        Used by the stream's speed-badge overlay. Returns the most recent
-        HUMAN command — not whatever is currently driving the robot — so
-        the badge reflects operator intent.
+        Returns whichever source the arbiter currently selects — so the
+        stream overlay (speed badge) reflects whoever is actually driving
+        the robot (human or AI). Lock and brake are always reported from
+        the human side, since AI cannot unlock or un-brake.
 
         Do NOT pass this to the recorder. Use published_state().
         """
         with self._lock:
-            lin, ang, locked, braking, _t = self._latest_human
-            return lin, ang, locked, braking
+            now = time.monotonic()
+            h_lin, h_ang, h_locked, h_brake, _h_t = self._latest_human
+            a_lin, a_ang, _a_lk, _a_br, _a_t      = self._latest_ai
+
+            handback_active  = now < self._human_active_until
+            human_in_control = handback_active or (not self._ai_enabled)
+
+            if human_in_control:
+                return h_lin, h_ang, h_locked, h_brake
+            return a_lin, a_ang, h_locked, h_brake
 
     def published_state(self) -> tuple[float, float]:
         """Last (lin_x, ang_z) actually sent to /cmd_vel — for the recorder.
