@@ -116,7 +116,9 @@ class UdpListener(threading.Thread):
             try:
                 self._on_packet(pkt, addr, self._port)
             except Exception as exc:
+                import traceback
                 log("teleop", f"{self._label} dispatch error: {exc}")
+                log("teleop", traceback.format_exc())
 
         try:
             if self._sock is not None:

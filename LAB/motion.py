@@ -140,8 +140,16 @@ class MotionController:
 
             self._executor = SingleThreadedExecutor()
             self._executor.add_node(self._node)
+            def _spin_safe():
+                try:
+                    self._executor.spin()
+                except Exception as exc:
+                    log("motion", f"executor spin died: {exc}")
+                    import traceback
+                    log("motion", traceback.format_exc())
+
             self._executor_thread = threading.Thread(
-                target=self._executor.spin, daemon=True, name="motion-spin"
+                target=_spin_safe, daemon=True, name="motion-spin"
             )
             self._executor_thread.start()
 
@@ -300,16 +308,24 @@ class MotionController:
 
     def _publish_loop(self) -> None:
         interval = 1.0 / self._publish_hz
-        while not self._stop.is_set():
-            lin, ang = self._compute_output()
-            self._send_twist(lin, ang)
-
-            # Store synchronously — published_state() returns this to the recorder.
-            with self._lock:
-                self._last_pub_lin = lin
-                self._last_pub_ang = ang
-
-            self._stop.wait(timeout=interval)
+        last_heartbeat = time.monotonic()
+        try:
+            while not self._stop.is_set():
+                lin, ang = self._compute_output()
+                self._send_twist(lin, ang)
+                with self._lock:
+                    self._last_pub_lin = lin
+                    self._last_pub_ang = ang
+                # Heartbeat every 10s so you know the loop is alive
+                now = time.monotonic()
+                if now - last_heartbeat > 10.0:
+                    log("motion", f"publish loop alive (last pub: lin={lin:.3f} ang={ang:.3f})")
+                    last_heartbeat = now
+                self._stop.wait(timeout=interval)
+        except Exception as exc:
+            log("motion", f"publish loop CRASHED: {exc}")
+            import traceback
+            log("motion", traceback.format_exc())
 
     def _compute_output(self) -> tuple[float, float]:
         """Pick a source (human vs AI), then apply universal gates.
@@ -369,5 +385,5 @@ class MotionController:
             t.linear.x  = float(lin)
             t.angular.z = float(ang)
             self._pub.publish(t)
-        except Exception:
-            pass
+        except Exception as exc:
+            log("motion", f"publish failed: {exc}")
